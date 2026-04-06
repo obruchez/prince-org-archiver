@@ -29,9 +29,11 @@ def media_path(config: Config, url: str, media_type: MediaType) -> Path:
 
 
 def save_media(config: Config, url: str, media_type: MediaType, data: bytes) -> Path:
+    from archiver.storage.html_writer import _atomic_write
+
     path = media_path(config, url, media_type)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(data)
+    _atomic_write(path, data)
     return path
 
 
