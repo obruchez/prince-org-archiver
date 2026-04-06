@@ -59,6 +59,27 @@ async def crawl_thread_ids(
             logger.debug(f"Thread {thread_id}: error - {result.error}")
             return
 
+        if result.status_code == 404:
+            await db.upsert_thread(thread_id, status=ThreadStatus.NOT_FOUND)
+            stats["not_found"] += 1
+            return
+
+        if result.status_code == 403:
+            await db.upsert_thread(
+                thread_id, status=ThreadStatus.ERROR,
+                error_message="HTTP 403 Forbidden",
+            )
+            stats["errors"] += 1
+            return
+
+        if result.status_code not in (200, 301, 302):
+            await db.upsert_thread(
+                thread_id, status=ThreadStatus.ERROR,
+                error_message=f"HTTP {result.status_code}",
+            )
+            stats["errors"] += 1
+            return
+
         parsed = parse_thread_page(thread_id, 1, result.content)
 
         if parsed.response_type == ResponseType.NOT_FOUND:
