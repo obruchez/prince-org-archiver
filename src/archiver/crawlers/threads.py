@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import time
 
 from archiver.client import HttpClient, MaxRequestsReached
@@ -16,6 +17,14 @@ from archiver.storage.html_writer import save_thread_metadata, save_thread_page
 from archiver.storage.media_writer import classify_media_url
 
 logger = logging.getLogger(__name__)
+
+
+def _forum_id_from_url(url: str | None) -> int | None:
+    """Extract forum ID from a URL like https://prince.org/msg/105/12345."""
+    if not url:
+        return None
+    match = re.search(r"/msg/(\d+)/", url)
+    return int(match.group(1)) if match else None
 
 
 async def crawl_thread_ids(
@@ -88,7 +97,9 @@ async def crawl_thread_ids(
             return
 
         if parsed.response_type == ResponseType.FORUM_CLOSED:
-            await db.upsert_thread(thread_id, status=ThreadStatus.CLOSED)
+            # Extract forum ID from redirect URL (e.g. /msg/105/12345 -> forum 105)
+            forum_id = _forum_id_from_url(result.final_url)
+            await db.upsert_thread(thread_id, forum_id=forum_id, status=ThreadStatus.CLOSED)
             stats["closed"] += 1
             return
 

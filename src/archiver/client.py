@@ -21,6 +21,7 @@ class FetchResult:
     status_code: int
     content: bytes
     response_time: float
+    final_url: str | None = None
     error: str | None = None
 
 
@@ -87,6 +88,7 @@ class HttpClient:
                 status_code=response.status_code,
                 content=response.content,
                 response_time=elapsed,
+                final_url=str(response.url),
             )
 
         except RetryExhausted as e:
