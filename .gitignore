@@ -1,0 +1,25 @@
+# Archived data (large)
+data/
+
+# Python
+*.pyc
+__pycache__/
+*.egg-info/
+dist/
+build/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment / secrets
+.env
+
+# Logs
+*.log
+
+# Claude Code
+.claude/
