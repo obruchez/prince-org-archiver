@@ -260,6 +260,58 @@ async def _run_events_crawl(config: Config):
     await db.close()
 
 
+@crawl.command("backfill")
+@common_options
+def crawl_backfill(data_dir, rate, concurrency, max_requests, max_duration, retry_errors, verbose):
+    """Backfill forum IDs for closed threads."""
+    config = make_config(data_dir, rate, concurrency, max_requests, max_duration, retry_errors)
+    setup_logging(config, verbose)
+    config.ensure_dirs()
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    asyncio.run(_run_backfill(config))
+
+
+async def _run_backfill(config: Config):
+    from archiver.crawlers.backfill import backfill_closed_forum_ids
+
+    db = Database(config.db_path)
+    await db.connect()
+
+    # Count how many need backfilling
+    rows = await db.db.execute_fetchall(
+        "SELECT COUNT(*) FROM threads WHERE status = 'closed' AND forum_id IS NULL"
+    )
+    total = rows[0][0]
+    console.print(f"[bold]Backfilling forum IDs for {total:,} closed threads[/bold]")
+
+    if total == 0:
+        console.print("[green]Nothing to backfill.[/green]")
+        await db.close()
+        return
+
+    async with HttpClient(config) as client:
+        def on_progress(stats):
+            if _shutdown:
+                raise KeyboardInterrupt
+            console.print(
+                f"  Updated: {stats['updated']:,}, errors: {stats['errors']:,} "
+                f"| {client.request_count:,} requests"
+            )
+
+        try:
+            stats = await backfill_closed_forum_ids(
+                config, db, client, progress_callback=on_progress
+            )
+            console.print(f"\n[green]Backfill complete:[/green] {stats}")
+        except KeyboardInterrupt:
+            console.print("[yellow]Interrupted. Progress saved.[/yellow]")
+
+    await db.close()
+
+
 @crawl.command("all")
 @common_options
 @click.option("--priority-forums", type=str, default="7,100,8")

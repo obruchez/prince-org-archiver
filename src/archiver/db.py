@@ -201,6 +201,22 @@ class Database:
             )
         return [dict(r) for r in rows]
 
+    async def get_closed_threads_missing_forum(self, limit: int = 100) -> list[dict]:
+        rows = await self.db.execute_fetchall(
+            """SELECT * FROM threads
+               WHERE status = 'closed' AND forum_id IS NULL
+               ORDER BY thread_id LIMIT ?""",
+            (limit,),
+        )
+        return [dict(r) for r in rows]
+
+    async def update_thread_forum(self, thread_id: int, forum_id: int) -> None:
+        await self.db.execute(
+            "UPDATE threads SET forum_id = ?, last_crawled = CURRENT_TIMESTAMP WHERE thread_id = ?",
+            (forum_id, thread_id),
+        )
+        await self.db.commit()
+
     async def increment_pages_downloaded(self, thread_id: int) -> None:
         await self.db.execute(
             "UPDATE threads SET pages_downloaded = pages_downloaded + 1 WHERE thread_id = ?",
