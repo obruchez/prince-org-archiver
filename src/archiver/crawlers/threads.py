@@ -42,9 +42,15 @@ async def crawl_thread_ids(
     """Phase 1: Enumerate thread IDs, download page 1 of each."""
     stats = {"found": 0, "not_found": 0, "closed": 0, "errors": 0, "skipped": 0}
 
-    # Determine start point (resume from last processed ID)
-    last_id = await db.get_state("last_enumerated_id")
-    start_id = int(last_id) + 1 if last_id else config.start_id
+    # Determine start point. An explicit --start-id (anything other than
+    # the default 1) overrides the resume checkpoint, so specific ID ranges
+    # can be re-processed (e.g. retrying errored threads). Otherwise resume
+    # from the last enumerated ID.
+    if config.start_id != 1:
+        start_id = config.start_id
+    else:
+        last_id = await db.get_state("last_enumerated_id")
+        start_id = int(last_id) + 1 if last_id else config.start_id
 
     logger.info(f"Starting thread enumeration from ID {start_id} to {config.end_id}")
 
@@ -171,6 +177,10 @@ async def crawl_thread_ids(
                 f"(forum {meta.forum_id}, {meta.page_count} pages)"
             )
 
+    # A targeted re-run (explicit --start-id) must not rewind the global
+    # enumeration high-water mark used by normal resume.
+    track_checkpoint = config.start_id == 1
+
     # Process IDs sequentially in batches
     batch_size = 50
     for batch_start in range(start_id, config.end_id + 1, batch_size):
@@ -179,7 +189,8 @@ async def crawl_thread_ids(
         await asyncio.gather(*tasks)
 
         # Save checkpoint
-        await db.set_state("last_enumerated_id", str(batch_end - 1))
+        if track_checkpoint:
+            await db.set_state("last_enumerated_id", str(batch_end - 1))
 
         if progress_callback:
             progress_callback(batch_end - 1, stats)
