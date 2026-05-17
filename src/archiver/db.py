@@ -76,11 +76,25 @@ CREATE TABLE IF NOT EXISTS crawl_state (
     value TEXT
 );
 
+CREATE TABLE IF NOT EXISTS wayback (
+    target_type TEXT NOT NULL,           -- 'thread' | 'index'
+    target_key  TEXT NOT NULL,           -- thread_id | forum_id (as text)
+    forum_id    INTEGER,
+    status      TEXT DEFAULT 'pending',  -- pending|recovered|no_capture|error
+    snapshot_ts TEXT,
+    html_path   TEXT,
+    snapshots_found INTEGER DEFAULT 0,
+    error_message TEXT,
+    attempted_at TIMESTAMP,
+    PRIMARY KEY (target_type, target_key)
+);
+
 CREATE INDEX IF NOT EXISTS idx_threads_status ON threads(status);
 CREATE INDEX IF NOT EXISTS idx_threads_forum ON threads(forum_id);
 CREATE INDEX IF NOT EXISTS idx_thread_pages_status ON thread_pages(status);
 CREATE INDEX IF NOT EXISTS idx_media_status ON media(status);
 CREATE INDEX IF NOT EXISTS idx_media_type ON media(type);
+CREATE INDEX IF NOT EXISTS idx_wayback_status ON wayback(status);
 """
 
 
@@ -411,6 +425,88 @@ class Database:
             (year, month, status, html_path),
         )
         await self.db.commit()
+
+    # -- Wayback recovery worklist --
+
+    async def seed_wayback_threads(self, kind: str) -> int:
+        """Populate the wayback worklist with thread targets.
+
+        kind='gated'  -> complete-but-error-stub threads (forum_id IS NULL)
+        kind='closed' -> threads in permanently closed forums
+        Existing rows are left untouched (idempotent / resumable)."""
+        if kind == "gated":
+            where = "status = 'complete' AND forum_id IS NULL"
+        elif kind == "closed":
+            where = "status = 'closed'"
+        else:
+            raise ValueError(f"unknown kind {kind!r}")
+        cur = await self.db.execute(
+            f"""INSERT OR IGNORE INTO wayback
+                (target_type, target_key, forum_id, status)
+                SELECT 'thread', CAST(thread_id AS TEXT), forum_id, 'pending'
+                FROM threads WHERE {where}""",
+        )
+        await self.db.commit()
+        return cur.rowcount
+
+    async def seed_wayback_index(self, forum_ids: list[int]) -> int:
+        n = 0
+        for fid in forum_ids:
+            cur = await self.db.execute(
+                """INSERT OR IGNORE INTO wayback
+                   (target_type, target_key, forum_id, status)
+                   VALUES ('index', ?, ?, 'pending')""",
+                (str(fid), fid),
+            )
+            n += cur.rowcount
+        await self.db.commit()
+        return n
+
+    async def get_pending_wayback(
+        self, target_type: str | None = None, limit: int = 100
+    ) -> list[dict]:
+        if target_type:
+            rows = await self.db.execute_fetchall(
+                """SELECT * FROM wayback WHERE status = 'pending'
+                   AND target_type = ? ORDER BY target_key LIMIT ?""",
+                (target_type, limit),
+            )
+        else:
+            rows = await self.db.execute_fetchall(
+                """SELECT * FROM wayback WHERE status = 'pending'
+                   ORDER BY target_type, target_key LIMIT ?""",
+                (limit,),
+            )
+        return [dict(r) for r in rows]
+
+    async def update_wayback(
+        self,
+        target_type: str,
+        target_key: str,
+        *,
+        status: str,
+        snapshot_ts: str | None = None,
+        html_path: str | None = None,
+        snapshots_found: int | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        await self.db.execute(
+            """UPDATE wayback SET
+                 status = ?, snapshot_ts = ?, html_path = ?,
+                 snapshots_found = COALESCE(?, snapshots_found),
+                 error_message = ?, attempted_at = CURRENT_TIMESTAMP
+               WHERE target_type = ? AND target_key = ?""",
+            (status, snapshot_ts, html_path, snapshots_found,
+             error_message, target_type, target_key),
+        )
+        await self.db.commit()
+
+    async def wayback_stats(self) -> dict:
+        rows = await self.db.execute_fetchall(
+            "SELECT target_type, status, COUNT(*) AS n FROM wayback "
+            "GROUP BY target_type, status"
+        )
+        return {f"{r[0]}_{r[1]}": r[2] for r in rows}
 
     # -- Statistics --
 

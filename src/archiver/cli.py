@@ -353,6 +353,61 @@ async def _run_metadata_backfill(config: Config, do_forum: bool, do_dates: bool)
     await db.close()
 
 
+@crawl.command("wayback")
+@click.option("--data-dir", type=click.Path(), default="data", help="Output directory")
+@click.option("-v", "--verbose", is_flag=True, help="Verbose output")
+@click.option("--target", "targets", multiple=True,
+              type=click.Choice(["gated", "closed", "index"]),
+              default=["gated", "closed", "index"],
+              help="What to recover (repeatable)")
+@click.option("--rate", type=float, default=1.0,
+              help="Requests/sec against web.archive.org")
+@click.option("--limit", type=int, default=None,
+              help="Stop after N targets (for testing)")
+def crawl_wayback(data_dir, verbose, targets, rate, limit):
+    """Recover gone content from the Wayback Machine (archive.org)."""
+    config = Config(data_dir=Path(data_dir), wayback_rate=rate)
+    setup_logging(config, verbose)
+    config.ensure_dirs()
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    asyncio.run(_run_wayback(config, list(targets), limit))
+
+
+async def _run_wayback(config: Config, targets: list[str], limit):
+    from archiver.crawlers.wayback import recover_via_wayback
+
+    db = Database(config.db_path)
+    await db.connect()
+
+    console.print(
+        f"[bold]Wayback recovery[/bold] targets={targets} "
+        f"rate={config.wayback_rate}/s"
+        + (f" limit={limit}" if limit else "")
+    )
+
+    def on_progress(stats):
+        if _shutdown:
+            raise KeyboardInterrupt
+        console.print(
+            f"  done={stats['done']:,} | recovered={stats['recovered']:,} "
+            f"no_capture={stats['no_capture']:,} errors={stats['error']:,}"
+        )
+
+    try:
+        stats = await recover_via_wayback(
+            config, db, targets=targets, limit=limit,
+            progress_callback=on_progress,
+        )
+        console.print(f"\n[green]Wayback recovery complete:[/green] {stats}")
+    except KeyboardInterrupt:
+        console.print("[yellow]Interrupted. Progress saved.[/yellow]")
+
+    await db.close()
+
+
 @crawl.command("all")
 @common_options
 @click.option("--priority-forums", type=str, default="7,100,8")

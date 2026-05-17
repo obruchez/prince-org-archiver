@@ -50,6 +50,30 @@ def save_thread_metadata(config: Config, metadata: ThreadMetadata) -> Path:
     return path
 
 
+def save_wayback_thread(
+    config: Config, thread_id: int, snapshot_ts: str, html: bytes
+) -> Path:
+    """Store a Wayback-recovered thread page separately from the live
+    archive (never overwrites a real live capture); snapshot timestamp
+    is part of the filename for provenance."""
+    bucket = f"{thread_id // 1000:03d}"
+    d = config.wayback_threads_dir / bucket / str(thread_id)
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"{snapshot_ts}.html"
+    _atomic_write(path, html)
+    return path
+
+
+def save_wayback_index(
+    config: Config, forum_id: int, snapshot_ts: str, html: bytes
+) -> Path:
+    d = config.wayback_index_dir / str(forum_id)
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"{snapshot_ts}.html"
+    _atomic_write(path, html)
+    return path
+
+
 def save_events_page(config: Config, year: int, month: int, html: bytes) -> Path:
     d = config.events_dir / str(year)
     d.mkdir(parents=True, exist_ok=True)

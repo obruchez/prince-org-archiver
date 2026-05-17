@@ -1,0 +1,300 @@
+"""Wayback Machine (archive.org) recovery crawler.
+
+Salvages content that is gone from the live site:
+
+  * gated stubs  -> threads moderator-removed since our crawl (saved as
+                    the 3.5 KB error page; DB forum_id IS NULL)
+  * closed       -> threads in permanently closed forums
+  * index        -> forum listing pages (heavily archived; recovers
+                    titles/links/first posts even when thread pages
+                    were never snapshotted)
+
+Two-step per target: CDX API lists snapshots, then the raw page is
+fetched via the `id_` replay modifier (original bytes, no IA toolbar).
+Coverage is partial and skewed toward older content -- recent removed
+threads frequently have no captures at all.
+
+archive.org is rate-sensitive (we saw 503/504 under light load), so
+this crawler is deliberately slow, single-flight, and backs off hard.
+It is fully resumable via the `wayback` table.
+"""
+
+import asyncio
+import json
+import logging
+import time
+
+import httpx
+
+from archiver.config import Config
+from archiver.crawlers.metadata_backfill import extract_forum_id
+from archiver.db import Database
+from archiver.storage.html_writer import (
+    save_wayback_index,
+    save_wayback_thread,
+    thread_dir,
+)
+
+logger = logging.getLogger(__name__)
+
+CDX_URL = "https://web.archive.org/cdx/search/cdx"
+REPLAY = "https://web.archive.org/web/{ts}id_/{url}"
+
+# Per target, fetch at most this many candidate snapshots (oldest first)
+# before giving up -- bounds requests on low-yield targets.
+MAX_SNAPSHOTS_PER_TARGET = 6
+MAX_BACKOFF = 120.0
+
+
+class WaybackClient:
+    """Gentle single-flight client: fixed spacing + hard backoff on the
+    statuses archive.org throws when it wants you to slow down."""
+
+    def __init__(self, rate: float):
+        self._min_interval = 1.0 / rate if rate > 0 else 1.0
+        self._last = 0.0
+        self._client: httpx.AsyncClient | None = None
+
+    async def __aenter__(self):
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(90.0),
+            follow_redirects=True,
+            headers={"User-Agent": "PrinceOrgArchiver/0.1 (archival research)"},
+        )
+        return self
+
+    async def __aexit__(self, *a):
+        if self._client:
+            await self._client.aclose()
+
+    async def _pace(self) -> None:
+        wait = self._min_interval - (time.monotonic() - self._last)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        self._last = time.monotonic()
+
+    async def get(self, url: str, params: dict | None = None) -> httpx.Response | None:
+        """Returns a 200 response, or None if it stays unavailable."""
+        backoff = 5.0
+        for attempt in range(6):
+            await self._pace()
+            try:
+                r = await self._client.get(url, params=params)
+            except (httpx.TimeoutException, httpx.TransportError) as e:
+                logger.debug(f"wayback transport error: {e}")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, MAX_BACKOFF)
+                continue
+            if r.status_code == 200:
+                return r
+            if r.status_code in (429, 503, 504, 502):
+                retry_after = r.headers.get("Retry-After")
+                delay = (
+                    float(retry_after)
+                    if retry_after and retry_after.isdigit()
+                    else backoff
+                )
+                logger.warning(
+                    f"archive.org {r.status_code}; backing off {delay:.0f}s"
+                )
+                await asyncio.sleep(delay)
+                backoff = min(backoff * 2, MAX_BACKOFF)
+                continue
+            # 404 etc. -- nothing here, don't retry.
+            return None
+        return None
+
+
+def _looks_like_thread(html: bytes) -> bool:
+    return (
+        b"Thread started" in html
+        and b"<title>error</title>" not in html
+        and b"not yet approved" not in html
+    )
+
+
+def _looks_like_index(html: bytes) -> bool:
+    return b"/msg/" in html and b"<title>error</title>" not in html
+
+
+async def _cdx(client: WaybackClient, params: dict) -> list[list[str]]:
+    """Return CDX rows (without the header row); [] on no captures/failure."""
+    p = {
+        "output": "json",
+        "fl": "timestamp,original,statuscode,digest,length",
+        "collapse": "digest",
+        "filter": "statuscode:200",
+        "limit": "40",
+        **params,
+    }
+    r = await client.get(CDX_URL, params=p)
+    if r is None:
+        return []
+    txt = r.text.strip()
+    if not txt or txt == "[]":
+        return []
+    try:
+        rows = json.loads(txt)
+    except json.JSONDecodeError:
+        return []
+    return rows[1:] if rows else []
+
+
+def _thread_cdx_params(thread_id: int, forum_id: int | None) -> dict:
+    if forum_id is not None:
+        # Prefix match catches ?pg=N, scheme/host variants, :80, etc.
+        return {"url": f"prince.org/msg/{forum_id}/{thread_id}", "matchType": "prefix"}
+    # Forum unknown: scan the domain for any /msg/<fid>/<tid> capture.
+    return {
+        "url": "prince.org",
+        "matchType": "domain",
+        "filter": [
+            "statuscode:200",
+            rf"original:.*/msg/[0-9]+/{thread_id}([?&/].*)?",
+        ],
+    }
+
+
+async def _recover_thread(
+    client: WaybackClient, config: Config, db: Database, row: dict
+) -> str:
+    thread_id = int(row["target_key"])
+    forum_id = row["forum_id"]
+    if forum_id is None:
+        # Try to learn the forum from the saved stub's chrome.
+        stub = thread_dir(config, thread_id) / "page_1.html"
+        if stub.exists():
+            forum_id = extract_forum_id(stub.read_bytes(), thread_id)
+
+    snaps = await _cdx(client, _thread_cdx_params(thread_id, forum_id))
+    if not snaps:
+        await db.update_wayback(
+            "thread", str(thread_id), status="no_capture", snapshots_found=0
+        )
+        return "no_capture"
+
+    snaps.sort(key=lambda r: r[0])  # oldest first: most likely pre-removal
+    for ts, original, *_ in snaps[:MAX_SNAPSHOTS_PER_TARGET]:
+        r = await client.get(REPLAY.format(ts=ts, url=original))
+        if r is None:
+            continue
+        html = r.content
+        if _looks_like_thread(html):
+            path = save_wayback_thread(config, thread_id, ts, html)
+            await db.update_wayback(
+                "thread", str(thread_id), status="recovered",
+                snapshot_ts=ts, html_path=str(path),
+                snapshots_found=len(snaps),
+            )
+            return "recovered"
+
+    await db.update_wayback(
+        "thread", str(thread_id), status="no_capture",
+        snapshots_found=len(snaps),
+        error_message="snapshots found but none showed thread content",
+    )
+    return "no_capture"
+
+
+async def _recover_index(
+    client: WaybackClient, config: Config, db: Database, row: dict
+) -> str:
+    forum_id = int(row["target_key"])
+    snaps = await _cdx(
+        client, {"url": f"prince.org/msg/{forum_id}", "matchType": "prefix"}
+    )
+    if not snaps:
+        await db.update_wayback(
+            "index", str(forum_id), status="no_capture", snapshots_found=0
+        )
+        return "no_capture"
+
+    # Keep one snapshot per calendar year to capture the forum's evolution
+    # without re-downloading near-identical daily crawls.
+    by_year: dict[str, list[str]] = {}
+    for ts, original, *_ in sorted(snaps, key=lambda r: r[0]):
+        by_year.setdefault(ts[:4], [original, ts])
+
+    saved = 0
+    last_ts = None
+    for year, (original, ts) in sorted(by_year.items()):
+        r = await client.get(REPLAY.format(ts=ts, url=original))
+        if r is None or not _looks_like_index(r.content):
+            continue
+        save_wayback_index(config, forum_id, ts, r.content)
+        saved += 1
+        last_ts = ts
+
+    status = "recovered" if saved else "no_capture"
+    await db.update_wayback(
+        "index", str(forum_id), status=status,
+        snapshot_ts=last_ts, snapshots_found=len(snaps),
+        error_message=None if saved else "snapshots found but unusable",
+    )
+    return status
+
+
+async def recover_via_wayback(
+    config: Config,
+    db: Database,
+    *,
+    targets: list[str],
+    forum_ids: list[int] | None = None,
+    limit: int | None = None,
+    progress_callback=None,
+) -> dict:
+    """Seed the worklist for the requested targets and work it.
+
+    targets: any of 'gated', 'closed', 'index'.
+    """
+    if "gated" in targets:
+        await db.seed_wayback_threads("gated")
+    if "closed" in targets:
+        await db.seed_wayback_threads("closed")
+    if "index" in targets:
+        await db.seed_wayback_index(forum_ids or sorted(
+            {7, 100, 8, 5, 5001, 9, 12, 3, 2, 13}
+        ))
+
+    want_thread = "gated" in targets or "closed" in targets
+    want_index = "index" in targets
+
+    stats = {"recovered": 0, "no_capture": 0, "error": 0, "done": 0}
+
+    async with WaybackClient(config.wayback_rate) as client:
+        while True:
+            if limit is not None and stats["done"] >= limit:
+                break
+
+            batch: list[dict] = []
+            if want_index:
+                batch += await db.get_pending_wayback("index", limit=20)
+            if want_thread and len(batch) < 50:
+                batch += await db.get_pending_wayback(
+                    "thread", limit=50 - len(batch)
+                )
+            if not batch:
+                break
+
+            for row in batch:
+                if limit is not None and stats["done"] >= limit:
+                    break
+                try:
+                    if row["target_type"] == "index":
+                        outcome = await _recover_index(client, config, db, row)
+                    else:
+                        outcome = await _recover_thread(client, config, db, row)
+                except Exception as e:  # never let one bad target stop the run
+                    logger.exception(f"wayback target {row['target_key']} failed")
+                    await db.update_wayback(
+                        row["target_type"], row["target_key"],
+                        status="error", error_message=str(e)[:200],
+                    )
+                    outcome = "error"
+
+                stats[outcome] = stats.get(outcome, 0) + 1
+                stats["done"] += 1
+                if progress_callback and stats["done"] % 25 == 0:
+                    progress_callback(stats)
+
+    return stats
