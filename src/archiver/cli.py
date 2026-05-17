@@ -312,6 +312,47 @@ async def _run_backfill(config: Config):
     await db.close()
 
 
+@crawl.command("metadata-backfill")
+@click.option("--data-dir", type=click.Path(), default="data", help="Output directory")
+@click.option("-v", "--verbose", is_flag=True, help="Verbose output")
+@click.option("--forum/--no-forum", default=True, help="Backfill missing forum_id")
+@click.option("--dates/--no-dates", default=True, help="Backfill post dates")
+def crawl_metadata_backfill(data_dir, verbose, forum, dates):
+    """Backfill forum_id / post dates from already-downloaded HTML (offline)."""
+    config = Config(data_dir=Path(data_dir))
+    setup_logging(config, verbose)
+    config.ensure_dirs()
+
+    signal.signal(signal.SIGINT, handle_signal)
+    asyncio.run(_run_metadata_backfill(config, forum, dates))
+
+
+async def _run_metadata_backfill(config: Config, do_forum: bool, do_dates: bool):
+    from archiver.crawlers.metadata_backfill import backfill_metadata_from_html
+
+    db = Database(config.db_path)
+    await db.connect()
+
+    console.print(
+        f"[bold]Offline metadata backfill[/bold] "
+        f"(forum_id={do_forum}, dates={do_dates})"
+    )
+
+    def on_progress(done, total, stats):
+        console.print(
+            f"  {done:,}/{total:,} | forum_id+={stats['forum_id']:,} "
+            f"dates+={stats['dates']:,} no_match={stats['no_match']:,} "
+            f"missing_files={stats['missing_files']:,}"
+        )
+
+    stats = await backfill_metadata_from_html(
+        config, db, do_forum=do_forum, do_dates=do_dates,
+        progress_callback=on_progress,
+    )
+    console.print(f"\n[green]Metadata backfill complete:[/green] {stats}")
+    await db.close()
+
+
 @crawl.command("all")
 @common_options
 @click.option("--priority-forums", type=str, default="7,100,8")

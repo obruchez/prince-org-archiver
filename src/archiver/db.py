@@ -280,6 +280,27 @@ class Database:
         )
         await self.db.commit()
 
+    async def update_thread_metadata(
+        self,
+        thread_id: int,
+        *,
+        forum_id: int | None = None,
+        first_post_date: str | None = None,
+        last_post_date: str | None = None,
+    ) -> None:
+        """Fill metadata fields, leaving any already-set / unprovided value
+        untouched (COALESCE keeps existing data; NULL args are no-ops)."""
+        await self.db.execute(
+            """UPDATE threads SET
+                 forum_id = COALESCE(?, forum_id),
+                 first_post_date = COALESCE(?, first_post_date),
+                 last_post_date = COALESCE(?, last_post_date),
+                 last_crawled = CURRENT_TIMESTAMP
+               WHERE thread_id = ?""",
+            (forum_id, first_post_date, last_post_date, thread_id),
+        )
+        await self.db.commit()
+
     async def increment_pages_downloaded(self, thread_id: int) -> None:
         await self.db.execute(
             "UPDATE threads SET pages_downloaded = pages_downloaded + 1 WHERE thread_id = ?",
