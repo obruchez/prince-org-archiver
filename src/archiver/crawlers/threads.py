@@ -18,6 +18,11 @@ from archiver.storage.media_writer import classify_media_url
 
 logger = logging.getLogger(__name__)
 
+# Per-page fetch attempts before the page is marked terminally 'failed'.
+# This is what guarantees the Phase 2 loop can finish: a page that can
+# never be fetched stops blocking termination after this many tries.
+MAX_PAGE_RETRIES = 5
+
 
 def _forum_id_from_url(url: str | None) -> int | None:
     """Extract forum ID from a URL like https://prince.org/msg/105/12345."""
@@ -212,15 +217,8 @@ async def crawl_remaining_pages(
 
         for thread in threads:
             thread_id = thread["thread_id"]
-            page_count = thread["page_count"]
-            pages_done = thread["pages_downloaded"]
 
-            for pg in range(pages_done + 1, page_count + 1):
-                # Check if page already downloaded
-                existing = await db.get_page(thread_id, pg)
-                if existing and existing["status"] == PageStatus.DOWNLOADED.value:
-                    continue
-
+            for pg in await db.get_pending_pages(thread_id):
                 async with sem:
                     url = client.thread_url(thread_id, pg)
                     try:
@@ -229,10 +227,15 @@ async def crawl_remaining_pages(
                         return stats
 
                 if result.error:
-                    await db.upsert_page(
-                        thread_id, pg, status=PageStatus.ERROR
+                    final_status = await db.record_page_failure(
+                        thread_id, pg, MAX_PAGE_RETRIES
                     )
                     stats["errors"] += 1
+                    if final_status == PageStatus.FAILED.value:
+                        logger.warning(
+                            f"Thread {thread_id} page {pg}: giving up after "
+                            f"{MAX_PAGE_RETRIES} attempts ({result.error})"
+                        )
                     continue
 
                 # Save HTML

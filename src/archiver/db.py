@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS thread_pages (
     post_count  INTEGER,
     downloaded_at TIMESTAMP,
     file_size   INTEGER,
+    retry_count INTEGER DEFAULT 0,
     PRIMARY KEY (thread_id, page_num)
 );
 
@@ -94,7 +95,18 @@ class Database:
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA synchronous=NORMAL")
         await self._db.executescript(SCHEMA)
+        await self._migrate()
         await self._db.commit()
+
+    async def _migrate(self) -> None:
+        """Apply additive schema migrations for pre-existing databases."""
+        cur = await self._db.execute("PRAGMA table_info(thread_pages)")
+        cols = {row[1] for row in await cur.fetchall()}
+        if "retry_count" not in cols:
+            await self._db.execute(
+                "ALTER TABLE thread_pages ADD COLUMN retry_count INTEGER DEFAULT 0"
+            )
+            logger.info("Migrated thread_pages: added retry_count column")
 
     async def close(self) -> None:
         if self._db:
@@ -183,23 +195,74 @@ class Database:
     async def get_threads_needing_pages(
         self, forum_ids: list[int] | None = None, limit: int = 100
     ) -> list[dict]:
+        # A thread needs work while it has any page that is neither
+        # downloaded nor terminally failed. Driving this off the actual
+        # thread_pages rows (rather than the pages_downloaded counter)
+        # guarantees the Phase 2 loop terminates: every page eventually
+        # reaches a terminal state ('downloaded' or 'failed').
+        unresolved = (
+            "EXISTS (SELECT 1 FROM thread_pages p "
+            "WHERE p.thread_id = t.thread_id "
+            "AND p.status NOT IN ('downloaded', 'failed'))"
+        )
         if forum_ids:
             placeholders = ",".join("?" * len(forum_ids))
             rows = await self.db.execute_fetchall(
-                f"""SELECT * FROM threads
-                    WHERE status = 'complete' AND page_count > pages_downloaded
-                    AND forum_id IN ({placeholders})
-                    ORDER BY thread_id LIMIT ?""",
+                f"""SELECT t.* FROM threads t
+                    WHERE t.status = 'complete'
+                    AND t.forum_id IN ({placeholders})
+                    AND {unresolved}
+                    ORDER BY t.thread_id LIMIT ?""",
                 (*forum_ids, limit),
             )
         else:
             rows = await self.db.execute_fetchall(
-                """SELECT * FROM threads
-                   WHERE status = 'complete' AND page_count > pages_downloaded
-                   ORDER BY thread_id LIMIT ?""",
+                f"""SELECT t.* FROM threads t
+                    WHERE t.status = 'complete'
+                    AND {unresolved}
+                    ORDER BY t.thread_id LIMIT ?""",
                 (limit,),
             )
         return [dict(r) for r in rows]
+
+    async def get_pending_pages(self, thread_id: int) -> list[int]:
+        """Page numbers for a thread that still need fetching (not terminal)."""
+        rows = await self.db.execute_fetchall(
+            """SELECT page_num FROM thread_pages
+               WHERE thread_id = ? AND status NOT IN ('downloaded', 'failed')
+               ORDER BY page_num""",
+            (thread_id,),
+        )
+        return [r[0] for r in rows]
+
+    async def record_page_failure(
+        self, thread_id: int, page_num: int, max_retries: int
+    ) -> str:
+        """Bump a page's retry count; mark it terminally 'failed' once the
+        retry budget is exhausted. Returns the resulting page status."""
+        rows = await self.db.execute_fetchall(
+            "SELECT retry_count FROM thread_pages WHERE thread_id = ? AND page_num = ?",
+            (thread_id, page_num),
+        )
+        retries = ((rows[0][0] or 0) if rows else 0) + 1
+        status = (
+            PageStatus.FAILED.value
+            if retries >= max_retries
+            else PageStatus.ERROR.value
+        )
+        await self.db.execute(
+            """INSERT INTO thread_pages
+               (thread_id, page_num, status, retry_count, downloaded_at)
+               VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(thread_id, page_num) DO UPDATE SET
+                 status = excluded.status,
+                 retry_count = excluded.retry_count,
+                 downloaded_at = CURRENT_TIMESTAMP
+            """,
+            (thread_id, page_num, status, retries),
+        )
+        await self.db.commit()
+        return status
 
     async def get_closed_threads_missing_forum(self, limit: int = 100) -> list[dict]:
         rows = await self.db.execute_fetchall(

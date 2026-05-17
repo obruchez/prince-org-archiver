@@ -16,6 +16,7 @@ class PageStatus(str, Enum):
     PENDING = "pending"
     DOWNLOADED = "downloaded"
     ERROR = "error"
+    FAILED = "failed"  # terminal: gave up after max retries
 
 
 class MediaStatus(str, Enum):
