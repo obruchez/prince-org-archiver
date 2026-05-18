@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import time
+import zlib
 
 import httpx
 
@@ -192,7 +193,15 @@ async def _recover_thread(
         r = await client.get(REPLAY.format(ts=ts, url=original))
         if r is None:
             continue
-        html = r.content
+        try:
+            html = r.content
+        except (httpx.DecodingError, zlib.error, OSError, ValueError) as e:
+            # Some old id_ captures carry a mislabeled / doubly-applied
+            # Content-Encoding that zlib refuses ("incorrect header
+            # check"). Skip just this snapshot and try the next one
+            # rather than failing the whole thread.
+            logger.debug(f"wayback {thread_id} snapshot {ts} undecodable: {e}")
+            continue
         if _looks_like_thread(html):
             path = save_wayback_thread(config, thread_id, ts, html)
             await db.update_wayback(
