@@ -278,14 +278,28 @@ class Database:
         await self.db.commit()
         return status
 
-    async def get_closed_threads_missing_forum(self, limit: int = 100) -> list[dict]:
+    async def get_closed_threads_missing_forum(
+        self, limit: int = 100, max_attempts: int = 3
+    ) -> list[dict]:
+        # Exclude threads whose forum_id we have tried and failed to obtain
+        # `max_attempts` times: a closed thread in a dead forum may never
+        # yield a forum_id via redirect, and without this cap the backfill
+        # loop would re-fetch it forever (same trap as the Phase 2 bug).
         rows = await self.db.execute_fetchall(
             """SELECT * FROM threads
                WHERE status = 'closed' AND forum_id IS NULL
+               AND retry_count < ?
                ORDER BY thread_id LIMIT ?""",
-            (limit,),
+            (max_attempts, limit),
         )
         return [dict(r) for r in rows]
+
+    async def increment_thread_retry(self, thread_id: int) -> None:
+        await self.db.execute(
+            "UPDATE threads SET retry_count = retry_count + 1 WHERE thread_id = ?",
+            (thread_id,),
+        )
+        await self.db.commit()
 
     async def update_thread_forum(self, thread_id: int, forum_id: int) -> None:
         await self.db.execute(

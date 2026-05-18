@@ -8,6 +8,10 @@ from archiver.db import Database
 
 logger = logging.getLogger(__name__)
 
+# Give up resolving a closed thread's forum_id after this many failed
+# attempts so the worklist drains and the loop terminates.
+MAX_BACKFILL_ATTEMPTS = 3
+
 
 async def backfill_closed_forum_ids(
     config: Config,
@@ -21,7 +25,9 @@ async def backfill_closed_forum_ids(
     sem = asyncio.Semaphore(config.concurrency)
 
     while True:
-        threads = await db.get_closed_threads_missing_forum(limit=50)
+        threads = await db.get_closed_threads_missing_forum(
+            limit=50, max_attempts=MAX_BACKFILL_ATTEMPTS
+        )
         if not threads:
             break
 
@@ -36,6 +42,9 @@ async def backfill_closed_forum_ids(
                     return stats
 
             if result.error:
+                # Bump the attempt counter so an unresolvable thread
+                # eventually drops out of the worklist (loop terminates).
+                await db.increment_thread_retry(thread_id)
                 stats["errors"] += 1
                 continue
 
@@ -44,6 +53,7 @@ async def backfill_closed_forum_ids(
                 await db.update_thread_forum(thread_id, forum_id)
                 stats["updated"] += 1
             else:
+                await db.increment_thread_retry(thread_id)
                 stats["errors"] += 1
 
         if progress_callback:

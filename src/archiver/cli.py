@@ -281,8 +281,12 @@ async def _run_backfill(config: Config):
     await db.connect()
 
     # Count how many need backfilling
+    from archiver.crawlers.backfill import MAX_BACKFILL_ATTEMPTS
+
     rows = await db.db.execute_fetchall(
-        "SELECT COUNT(*) FROM threads WHERE status = 'closed' AND forum_id IS NULL"
+        "SELECT COUNT(*) FROM threads WHERE status = 'closed' "
+        "AND forum_id IS NULL AND retry_count < ?",
+        (MAX_BACKFILL_ATTEMPTS,),
     )
     total = rows[0][0]
     console.print(f"[bold]Backfilling forum IDs for {total:,} closed threads[/bold]")
