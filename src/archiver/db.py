@@ -462,6 +462,20 @@ class Database:
         await self.db.commit()
         return n
 
+    async def requeue_wayback_no_forum(self) -> int:
+        """Re-pend wayback thread targets previously skipped for an unknown
+        forum_id, once that thread has since gained a forum_id (e.g. via
+        `crawl backfill`)."""
+        cur = await self.db.execute(
+            """UPDATE wayback SET status = 'pending', error_message = NULL
+               WHERE target_type = 'thread' AND status = 'no_forum'
+               AND target_key IN (
+                   SELECT CAST(thread_id AS TEXT) FROM threads
+                   WHERE forum_id IS NOT NULL)""",
+        )
+        await self.db.commit()
+        return cur.rowcount
+
     async def get_pending_wayback(
         self, target_type: str | None = None, limit: int = 100
     ) -> list[dict]:

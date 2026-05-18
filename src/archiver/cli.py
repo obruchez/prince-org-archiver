@@ -393,7 +393,8 @@ async def _run_wayback(config: Config, targets: list[str], limit):
             raise KeyboardInterrupt
         console.print(
             f"  done={stats['done']:,} | recovered={stats['recovered']:,} "
-            f"no_capture={stats['no_capture']:,} errors={stats['error']:,}"
+            f"no_capture={stats['no_capture']:,} "
+            f"no_forum={stats.get('no_forum', 0):,} errors={stats['error']:,}"
         )
 
     try:

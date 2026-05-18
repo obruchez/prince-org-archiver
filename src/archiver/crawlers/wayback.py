@@ -140,19 +140,13 @@ async def _cdx(client: WaybackClient, params: dict) -> list[list[str]]:
     return rows[1:] if rows else []
 
 
-def _thread_cdx_params(thread_id: int, forum_id: int | None) -> dict:
-    if forum_id is not None:
-        # Prefix match catches ?pg=N, scheme/host variants, :80, etc.
-        return {"url": f"prince.org/msg/{forum_id}/{thread_id}", "matchType": "prefix"}
-    # Forum unknown: scan the domain for any /msg/<fid>/<tid> capture.
-    return {
-        "url": "prince.org",
-        "matchType": "domain",
-        "filter": [
-            "statuscode:200",
-            rf"original:.*/msg/[0-9]+/{thread_id}([?&/].*)?",
-        ],
-    }
+def _thread_cdx_params(thread_id: int, forum_id: int) -> dict:
+    # ONLY tight prefix queries. A domain-wide CDX scan with a server-side
+    # regex filter makes archive.org 504 every time (it burned an entire
+    # overnight run via the backoff ladder), so we never do that: a target
+    # whose forum_id we cannot determine cheaply is skipped, not scanned.
+    # Prefix match still catches ?pg=N, scheme/host variants, :80, etc.
+    return {"url": f"prince.org/msg/{forum_id}/{thread_id}", "matchType": "prefix"}
 
 
 async def _recover_thread(
@@ -161,10 +155,21 @@ async def _recover_thread(
     thread_id = int(row["target_key"])
     forum_id = row["forum_id"]
     if forum_id is None:
-        # Try to learn the forum from the saved stub's chrome.
+        # Try to learn the forum from the saved stub's chrome (gated stubs
+        # always have this; closed-forum threads usually do not).
         stub = thread_dir(config, thread_id) / "page_1.html"
         if stub.exists():
             forum_id = extract_forum_id(stub.read_bytes(), thread_id)
+
+    if forum_id is None:
+        # No cheap way to know the forum -> do NOT domain-scan. Defer it;
+        # `crawl backfill` can fill closed-thread forum_ids, after which
+        # re-running wayback requeues these automatically.
+        await db.update_wayback(
+            "thread", str(thread_id), status="no_forum", snapshots_found=0,
+            error_message="forum_id unknown; run 'crawl backfill' then retry",
+        )
+        return "no_forum"
 
     snaps = await _cdx(client, _thread_cdx_params(thread_id, forum_id))
     if not snaps:
@@ -251,6 +256,10 @@ async def recover_via_wayback(
         await db.seed_wayback_threads("gated")
     if "closed" in targets:
         await db.seed_wayback_threads("closed")
+        # Rescue targets deferred on a previous run if forum_id is now known.
+        requeued = await db.requeue_wayback_no_forum()
+        if requeued:
+            logger.info(f"Requeued {requeued} wayback targets (forum_id now known)")
     if "index" in targets:
         await db.seed_wayback_index(forum_ids or sorted(
             {7, 100, 8, 5, 5001, 9, 12, 3, 2, 13}
