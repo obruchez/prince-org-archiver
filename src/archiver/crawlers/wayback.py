@@ -162,6 +162,15 @@ async def _recover_thread(
             forum_id = extract_forum_id(stub.read_bytes(), thread_id)
 
     if forum_id is None:
+        # Defensive: the worklist row may carry a stale NULL (seeded before
+        # `crawl backfill` filled it). sync_wayback_forum_ids() normally
+        # reconciles this up front, but fall back to the live threads row
+        # so a stale worklist can never silently waste a backfill.
+        t = await db.get_thread(thread_id)
+        if t:
+            forum_id = t["forum_id"]
+
+    if forum_id is None:
         # No cheap way to know the forum -> do NOT domain-scan. Defer it;
         # `crawl backfill` can fill closed-thread forum_ids, after which
         # re-running wayback requeues these automatically.
@@ -256,8 +265,12 @@ async def recover_via_wayback(
         await db.seed_wayback_threads("gated")
     if "closed" in targets:
         await db.seed_wayback_threads("closed")
-        # Rescue targets deferred on a previous run if forum_id is now known.
-        requeued = await db.requeue_wayback_no_forum()
+    if "gated" in targets or "closed" in targets:
+        # Pull in forum_ids resolved since the worklist was seeded (e.g. by
+        # `crawl backfill`) and rescue targets deferred as no_forum. Pending
+        # thread rows are worked regardless of which thread target is asked
+        # for, so always reconcile when any thread target is in play.
+        requeued = await db.sync_wayback_forum_ids()
         if requeued:
             logger.info(f"Requeued {requeued} wayback targets (forum_id now known)")
     if "index" in targets:

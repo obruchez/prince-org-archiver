@@ -476,16 +476,33 @@ class Database:
         await self.db.commit()
         return n
 
-    async def requeue_wayback_no_forum(self) -> int:
-        """Re-pend wayback thread targets previously skipped for an unknown
-        forum_id, once that thread has since gained a forum_id (e.g. via
-        `crawl backfill`)."""
+    async def sync_wayback_forum_ids(self) -> int:
+        """Reconcile the wayback worklist with forum_ids resolved later
+        (e.g. by `crawl backfill`).
+
+        The worklist is seeded once with INSERT OR IGNORE, so rows seeded
+        before backfill keep their original (NULL) forum_id even after
+        `threads.forum_id` is filled. Without this, those targets would be
+        re-classified `no_forum` and the backfill wasted. We:
+          1. copy the now-known forum_id onto stale-NULL thread rows, and
+          2. re-pend any target deferred as `no_forum` that now has one.
+        Returns the number of deferred targets re-pended."""
+        await self.db.execute(
+            """UPDATE wayback
+                 SET forum_id = (
+                     SELECT t.forum_id FROM threads t
+                     WHERE t.thread_id = CAST(wayback.target_key AS INTEGER))
+               WHERE target_type = 'thread'
+                 AND forum_id IS NULL
+                 AND EXISTS (
+                     SELECT 1 FROM threads t
+                     WHERE t.thread_id = CAST(wayback.target_key AS INTEGER)
+                       AND t.forum_id IS NOT NULL)""",
+        )
         cur = await self.db.execute(
             """UPDATE wayback SET status = 'pending', error_message = NULL
                WHERE target_type = 'thread' AND status = 'no_forum'
-               AND target_key IN (
-                   SELECT CAST(thread_id AS TEXT) FROM threads
-                   WHERE forum_id IS NOT NULL)""",
+                 AND forum_id IS NOT NULL""",
         )
         await self.db.commit()
         return cur.rowcount
