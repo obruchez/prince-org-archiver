@@ -131,7 +131,14 @@ async def _cdx(client: WaybackClient, params: dict) -> list[list[str]]:
     r = await client.get(CDX_URL, params=p)
     if r is None:
         return []
-    txt = r.text.strip()
+    try:
+        txt = r.text.strip()
+    except (httpx.DecodingError, zlib.error, OSError, ValueError) as e:
+        # archive.org occasionally returns a CDX body with a mislabeled
+        # Content-Encoding zlib refuses. Treat as "no captures" (the _cdx
+        # failure contract) rather than erroring the whole target.
+        logger.debug(f"wayback CDX undecodable: {e}")
+        return []
     if not txt or txt == "[]":
         return []
     try:
