@@ -20,7 +20,7 @@ class Config:
     error_budget: int = 50  # pause after this many consecutive errors
     adaptive_threshold: float = 5.0  # double delay if response > this many seconds
     base_url: str = "https://prince.org"
-    wayback_rate: float = 1.0  # requests/sec against web.archive.org (be gentle)
+    wayback_rate: float = 0.2  # requests/sec against web.archive.org (1 req/5s)
 
     @property
     def html_dir(self) -> Path:

@@ -45,11 +45,29 @@ REPLAY = "https://web.archive.org/web/{ts}id_/{url}"
 # before giving up -- bounds requests on low-yield targets.
 MAX_SNAPSHOTS_PER_TARGET = 6
 MAX_BACKOFF = 120.0
+# Cap adaptive pacing at one request every 10s. archive.org's
+# (undocumented) CDX limit is roughly 15 req/min for unauthenticated
+# clients; this stays comfortably under that even after we've grown.
+MAX_PACE = 10.0
+# Bail out of the run after this many targets in a row come back
+# throttled -- archive.org clearly wants us gone for now; resume later.
+MAX_CONSECUTIVE_THROTTLES = 5
+
+
+class WaybackThrottled(Exception):
+    """archive.org persistently rate-limited the request. Distinct from
+    `client.get()` returning None (which means a non-retryable miss like
+    404) so callers can keep the target `pending` instead of burning it
+    as `no_capture` or `error`."""
 
 
 class WaybackClient:
-    """Gentle single-flight client: fixed spacing + hard backoff on the
-    statuses archive.org throws when it wants you to slow down."""
+    """Gentle single-flight client: adaptive spacing + hard backoff on the
+    statuses archive.org throws when it wants you to slow down.
+
+    Pacing grows (never shrinks) on every throttle response, so a session
+    that trips the rate limit settles at a slower pace for the rest of
+    its life instead of oscillating between fast and 429'd."""
 
     def __init__(self, rate: float):
         self._min_interval = 1.0 / rate if rate > 0 else 1.0
@@ -74,21 +92,37 @@ class WaybackClient:
             await asyncio.sleep(wait)
         self._last = time.monotonic()
 
+    def _grow_pace(self) -> None:
+        new = min(self._min_interval * 2, MAX_PACE)
+        if new > self._min_interval:
+            logger.info(
+                f"wayback: pace -> 1 req / {new:.1f}s "
+                f"(was {self._min_interval:.1f}s)"
+            )
+            self._min_interval = new
+
     async def get(self, url: str, params: dict | None = None) -> httpx.Response | None:
-        """Returns a 200 response, or None if it stays unavailable."""
+        """Returns a 200 response, or None for a non-retryable miss (404
+        etc.). Raises WaybackThrottled when 6 attempts of 429/5xx/timeout
+        are exhausted -- the caller must keep the target pending in that
+        case, not mark it no_capture."""
         backoff = 5.0
+        throttled = False
         for attempt in range(6):
             await self._pace()
             try:
                 r = await self._client.get(url, params=params)
             except (httpx.TimeoutException, httpx.TransportError) as e:
                 logger.debug(f"wayback transport error: {e}")
+                throttled = True
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF)
                 continue
             if r.status_code == 200:
                 return r
             if r.status_code in (429, 503, 504, 502):
+                throttled = True
+                self._grow_pace()
                 retry_after = r.headers.get("Retry-After")
                 delay = (
                     float(retry_after)
@@ -103,6 +137,10 @@ class WaybackClient:
                 continue
             # 404 etc. -- nothing here, don't retry.
             return None
+        if throttled:
+            raise WaybackThrottled(
+                f"6 attempts exhausted (last backoff {backoff:.0f}s)"
+            )
         return None
 
 
@@ -297,7 +335,9 @@ async def recover_via_wayback(
     want_thread = "gated" in targets or "closed" in targets
     want_index = "index" in targets
 
-    stats = {"recovered": 0, "no_capture": 0, "error": 0, "done": 0}
+    stats = {"recovered": 0, "no_capture": 0, "error": 0, "throttled": 0,
+             "done": 0}
+    consecutive_throttles = 0
 
     async with WaybackClient(config.wayback_rate) as client:
         while True:
@@ -314,6 +354,7 @@ async def recover_via_wayback(
             if not batch:
                 break
 
+            stop_run = False
             for row in batch:
                 if limit is not None and stats["done"] >= limit:
                     break
@@ -322,6 +363,16 @@ async def recover_via_wayback(
                         outcome = await _recover_index(client, config, db, row)
                     else:
                         outcome = await _recover_thread(client, config, db, row)
+                    consecutive_throttles = 0
+                except WaybackThrottled as e:
+                    # Don't burn the DB row -- leave it pending so the next
+                    # run can retry. Just count it locally.
+                    logger.warning(
+                        f"wayback throttled on {row['target_key']}: {e}; "
+                        "leaving pending"
+                    )
+                    outcome = "throttled"
+                    consecutive_throttles += 1
                 except Exception as e:  # never let one bad target stop the run
                     logger.exception(f"wayback target {row['target_key']} failed")
                     await db.update_wayback(
@@ -329,10 +380,23 @@ async def recover_via_wayback(
                         status="error", error_message=str(e)[:200],
                     )
                     outcome = "error"
+                    consecutive_throttles = 0
 
                 stats[outcome] = stats.get(outcome, 0) + 1
                 stats["done"] += 1
                 if progress_callback and stats["done"] % 25 == 0:
                     progress_callback(stats)
+
+                if consecutive_throttles >= MAX_CONSECUTIVE_THROTTLES:
+                    logger.warning(
+                        f"wayback: {consecutive_throttles} throttles in a "
+                        "row -- archive.org wants us gone; stopping, "
+                        "resume later"
+                    )
+                    stop_run = True
+                    break
+
+            if stop_run:
+                break
 
     return stats

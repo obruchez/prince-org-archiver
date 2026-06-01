@@ -364,8 +364,9 @@ async def _run_metadata_backfill(config: Config, do_forum: bool, do_dates: bool)
               type=click.Choice(["gated", "closed", "index"]),
               default=["gated", "closed", "index"],
               help="What to recover (repeatable)")
-@click.option("--rate", type=float, default=1.0,
-              help="Requests/sec against web.archive.org")
+@click.option("--rate", type=float, default=0.2,
+              help="Requests/sec against web.archive.org (default 0.2 = 1 req/5s; "
+                   "stays under the ~15/min unauthenticated CDX limit)")
 @click.option("--limit", type=int, default=None,
               help="Stop after N targets (for testing)")
 def crawl_wayback(data_dir, verbose, targets, rate, limit):
@@ -398,7 +399,9 @@ async def _run_wayback(config: Config, targets: list[str], limit):
         console.print(
             f"  done={stats['done']:,} | recovered={stats['recovered']:,} "
             f"no_capture={stats['no_capture']:,} "
-            f"no_forum={stats.get('no_forum', 0):,} errors={stats['error']:,}"
+            f"no_forum={stats.get('no_forum', 0):,} "
+            f"throttled={stats.get('throttled', 0):,} "
+            f"errors={stats['error']:,}"
         )
 
     try:
