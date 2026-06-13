@@ -103,21 +103,43 @@ class WaybackClient:
 
     async def get(self, url: str, params: dict | None = None) -> httpx.Response | None:
         """Returns a 200 response, or None for a non-retryable miss (404
-        etc.). Raises WaybackThrottled when 6 attempts of 429/5xx/timeout
-        are exhausted -- the caller must keep the target pending in that
-        case, not mark it no_capture."""
+        or a body archive.org served with an unreadable Content-Encoding
+        even after asking for raw bytes). Raises WaybackThrottled when 6
+        attempts of 429/5xx/timeout are exhausted -- the caller must
+        keep the target pending in that case, not mark it no_capture."""
         backoff = 5.0
         throttled = False
+        # httpx eagerly reads + decompresses the body inside the get()
+        # call, so a body with a mislabeled Content-Encoding (zlib's
+        # "incorrect header check") raises here, BEFORE callers get to
+        # touch r.content. After one such failure we retry asking the
+        # server to skip compression entirely; that recovers most of
+        # archive.org's mis-encoded snapshots.
+        no_encoding = False
         for attempt in range(6):
             await self._pace()
+            hdrs = {"Accept-Encoding": "identity"} if no_encoding else None
             try:
-                r = await self._client.get(url, params=params)
+                r = await self._client.get(url, params=params, headers=hdrs)
+                _ = r.content  # force decode here if get() didn't already
             except (httpx.TimeoutException, httpx.TransportError) as e:
                 logger.debug(f"wayback transport error: {e}")
                 throttled = True
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF)
                 continue
+            except (httpx.DecodingError, zlib.error, OSError, ValueError) as e:
+                if not no_encoding:
+                    logger.info(
+                        f"wayback decode failed on {url}; "
+                        f"retrying once with Accept-Encoding: identity ({e})"
+                    )
+                    no_encoding = True
+                    continue
+                logger.debug(
+                    f"wayback decode failed even with identity: {e}"
+                )
+                return None
             if r.status_code == 200:
                 return r
             if r.status_code in (429, 503, 504, 502):
