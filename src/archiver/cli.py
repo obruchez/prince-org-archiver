@@ -416,6 +416,57 @@ async def _run_wayback(config: Config, targets: list[str], limit):
     await db.close()
 
 
+@crawl.command("integrate-wayback")
+@click.option("--data-dir", type=click.Path(), default="data", help="Output directory")
+@click.option("--limit", type=int, default=None,
+              help="Stop after N recovered threads (for testing)")
+@click.option("-v", "--verbose", is_flag=True, help="Verbose output")
+def crawl_integrate_wayback(data_dir, limit, verbose):
+    """Fold recovered Wayback HTML into the main threads/thread_pages
+    schema (parses titles/authors/page counts; registers media URLs)."""
+    config = Config(data_dir=Path(data_dir))
+    setup_logging(config, verbose)
+    config.ensure_dirs()
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    asyncio.run(_run_integrate_wayback(config, limit))
+
+
+async def _run_integrate_wayback(config: Config, limit):
+    from archiver.crawlers.wayback_integrate import integrate_recovered_wayback
+
+    db = Database(config.db_path)
+    await db.connect()
+
+    console.print(
+        "[bold]Integrating recovered Wayback threads[/bold]"
+        + (f" limit={limit}" if limit else "")
+    )
+
+    def on_progress(stats):
+        if _shutdown:
+            raise KeyboardInterrupt
+        console.print(
+            f"  scanned={stats['scanned']:,} | "
+            f"enriched={stats['enriched']:,} "
+            f"unparseable={stats['unparseable']:,} "
+            f"missing_file={stats['missing_file']:,} "
+            f"media_added={stats['media_added']:,}"
+        )
+
+    try:
+        stats = await integrate_recovered_wayback(
+            config, db, limit=limit, progress_callback=on_progress,
+        )
+        console.print(f"\n[green]Integration complete:[/green] {stats}")
+    except KeyboardInterrupt:
+        console.print("[yellow]Interrupted. Progress saved.[/yellow]")
+
+    await db.close()
+
+
 @crawl.command("all")
 @common_options
 @click.option("--priority-forums", type=str, default="7,100,8")

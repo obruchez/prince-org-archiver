@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS thread_pages (
     downloaded_at TIMESTAMP,
     file_size   INTEGER,
     retry_count INTEGER DEFAULT 0,
+    source      TEXT DEFAULT 'live',   -- 'live' | 'wayback'
+    snapshot_ts TEXT,                  -- Wayback timestamp when source='wayback'
     PRIMARY KEY (thread_id, page_num)
 );
 
@@ -121,6 +123,16 @@ class Database:
                 "ALTER TABLE thread_pages ADD COLUMN retry_count INTEGER DEFAULT 0"
             )
             logger.info("Migrated thread_pages: added retry_count column")
+        if "source" not in cols:
+            await self._db.execute(
+                "ALTER TABLE thread_pages ADD COLUMN source TEXT DEFAULT 'live'"
+            )
+            logger.info("Migrated thread_pages: added source column")
+        if "snapshot_ts" not in cols:
+            await self._db.execute(
+                "ALTER TABLE thread_pages ADD COLUMN snapshot_ts TEXT"
+            )
+            logger.info("Migrated thread_pages: added snapshot_ts column")
 
     async def close(self) -> None:
         if self._db:
@@ -369,6 +381,97 @@ class Database:
             (thread_id, page_num, status.value, html_path, post_count, file_size),
         )
         await self.db.commit()
+
+    # -- Wayback integration --
+
+    async def enrich_thread_from_wayback(
+        self,
+        thread_id: int,
+        *,
+        forum_id: int | None = None,
+        title: str | None = None,
+        author: str | None = None,
+        page_count: int | None = None,
+    ) -> None:
+        """Fill in metadata parsed from a recovered Wayback snapshot
+        without touching status/error_message.
+
+        For closed threads the live crawl never parsed the page (it just
+        recorded status='closed'); for gated threads the saved stub had a
+        garbage title='error'. The Wayback HTML is the only authoritative
+        source for these fields, so we overwrite title/author/page_count
+        unconditionally when we have a value -- but we keep the existing
+        forum_id when one is already set (live crawl + backfill are more
+        trustworthy than parsing forum_id out of historical chrome)."""
+        await self.db.execute(
+            """UPDATE threads SET
+                 forum_id = COALESCE(forum_id, ?),
+                 title = COALESCE(?, title),
+                 author = COALESCE(?, author),
+                 page_count = COALESCE(?, page_count),
+                 last_crawled = CURRENT_TIMESTAMP
+               WHERE thread_id = ?""",
+            (forum_id, title, author, page_count, thread_id),
+        )
+        await self.db.commit()
+
+    async def upsert_wayback_page(
+        self,
+        thread_id: int,
+        page_num: int,
+        *,
+        html_path: str,
+        snapshot_ts: str,
+        post_count: int | None = None,
+        file_size: int | None = None,
+    ) -> None:
+        """Record a Wayback snapshot as a thread_pages row with source
+        provenance. Replaces any existing live row at (thread_id, page_num)
+        -- for gated threads that's the useless 'error' stub the live
+        crawl saved; the stub file on disk is left alone but unreferenced."""
+        await self.db.execute(
+            """INSERT INTO thread_pages
+               (thread_id, page_num, status, html_path, post_count,
+                file_size, source, snapshot_ts, downloaded_at)
+               VALUES (?, ?, 'downloaded', ?, ?, ?, 'wayback', ?,
+                       CURRENT_TIMESTAMP)
+               ON CONFLICT(thread_id, page_num) DO UPDATE SET
+                 status = 'downloaded',
+                 html_path = excluded.html_path,
+                 post_count = excluded.post_count,
+                 file_size = excluded.file_size,
+                 source = 'wayback',
+                 snapshot_ts = excluded.snapshot_ts,
+                 downloaded_at = CURRENT_TIMESTAMP
+            """,
+            (thread_id, page_num, html_path, post_count, file_size, snapshot_ts),
+        )
+        await self.db.commit()
+
+    async def get_recovered_wayback_threads(
+        self, limit: int | None = None
+    ) -> list[dict]:
+        """Recovered Wayback thread rows that have an html_path on disk.
+        Indexes/no_captures are excluded."""
+        sql = (
+            "SELECT target_key AS thread_id, forum_id, snapshot_ts, html_path "
+            "FROM wayback "
+            "WHERE target_type = 'thread' AND status = 'recovered' "
+            "AND html_path IS NOT NULL "
+            "ORDER BY CAST(target_key AS INTEGER)"
+        )
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        rows = await self.db.execute_fetchall(sql)
+        return [
+            {
+                "thread_id": int(r["thread_id"]),
+                "forum_id": r["forum_id"],
+                "snapshot_ts": r["snapshot_ts"],
+                "html_path": r["html_path"],
+            }
+            for r in rows
+        ]
 
     # -- Media --
 
