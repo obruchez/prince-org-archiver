@@ -521,6 +521,27 @@ class Database:
             )
         return [dict(r) for r in rows]
 
+    async def requeue_transient_media_errors(self) -> int:
+        """Re-pend media rows that errored on transient network failures
+        so a plain restart of `crawl media` retries them automatically.
+
+        Distinguishes by error_message prefix:
+          * 'Retry exhausted ...'  -> from RetryExhausted in client.py,
+            i.e. the network was unreachable through the full 6-attempt
+            backoff ladder (~4 min). Re-pendable: the file is likely
+            fine, we just couldn't reach the server.
+          * 'HTTP <code>'         -> from a non-retryable HTTP status
+            (404, 410, 403). Kept terminal -- retrying won't change
+            anything and just wastes traffic against prince.org.
+
+        Returns the number of rows re-pended."""
+        cur = await self.db.execute(
+            "UPDATE media SET status = 'pending', error_message = NULL "
+            "WHERE status = 'error' AND error_message LIKE 'Retry exhausted%'"
+        )
+        await self.db.commit()
+        return cur.rowcount
+
     # -- Events --
 
     async def upsert_event(

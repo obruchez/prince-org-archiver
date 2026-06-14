@@ -22,6 +22,17 @@ async def crawl_media(
     stats = {"downloaded": 0, "errors": 0, "skipped": 0}
     sem = asyncio.Semaphore(config.concurrency)
 
+    # Heal any rows that errored on a transient network failure during a
+    # previous run (e.g. the user's connection went down mid-crawl).
+    # Permanent errors -- 404/410/403 etc. -- are left as 'error' so we
+    # don't re-burn requests on truly-missing files.
+    requeued = await db.requeue_transient_media_errors()
+    if requeued:
+        logger.info(
+            f"Re-pended {requeued} media rows that failed on transient "
+            "network errors in a previous run"
+        )
+
     while True:
         pending = await db.get_pending_media(media_type=media_type, limit=50)
         if not pending:
