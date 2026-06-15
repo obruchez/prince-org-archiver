@@ -531,19 +531,25 @@ class Database:
             6-attempt backoff ladder, ~4 min). Anything starting with
             'HTTP <code>' is a hard rejection (404/410/403) and stays
             terminal -- retrying won't change anything.
-          * `url LIKE '%prince.org%'` -- only re-pend our-target host.
-            External URLs (avatars/images hosted on long-dead 2008-era
-            forums like gatt.co.tt, madonna-avatars.ch, ebaumsworld...)
-            have ~0% revival rate; re-pending them just clusters more
-            doomed RetryExhausted bursts at the front of the queue and
-            blows the consecutive-error budget on restart.
+          * host = canonical prince.org (no subdomain). `img.prince.org`
+            and `new.prince.org` are DNS-dead -- they fail in 1 ms but
+            still burn the 6-attempt backoff ladder. We learned this the
+            hard way after the previous run blew the consecutive-error
+            budget on a batch of re-pended `img.prince.org` rows.
+            External hosts (madonna-avatars.ch, gatt.co.tt etc., from
+            2008-era captures) are likewise dead and never re-pended.
 
         Returns the number of rows re-pended."""
         cur = await self.db.execute(
             "UPDATE media SET status = 'pending', error_message = NULL "
             "WHERE status = 'error' "
             "AND error_message LIKE 'Retry exhausted%' "
-            "AND url LIKE '%prince.org%'"
+            "AND ("
+            "  url LIKE 'https://prince.org/%' OR "
+            "  url LIKE 'https://prince.org:%' OR "
+            "  url LIKE 'http://prince.org/%' OR "
+            "  url LIKE 'http://prince.org:%'"
+            ")"
         )
         await self.db.commit()
         return cur.rowcount
