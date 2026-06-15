@@ -1,8 +1,8 @@
 # Prince.org archive — coverage summary
 
 Snapshot of what this archive contains, how it's laid out, and where the
-remaining gaps are. Numbers were captured on 2026-06-14, after the
-Wayback recovery and integration passes completed.
+remaining gaps are. Numbers were captured on 2026-06-16, after the
+Wayback recovery, integration, and media download passes completed.
 
 ## Headline
 
@@ -20,7 +20,12 @@ Wayback recovery and integration passes completed.
 - **First archived post:** 1999-03-16. **Most recent:** 2026-04-22.
   ~27 years of continuous forum history.
 - **639,694** thread pages stored on disk (631,562 live + 8,132 wayback).
-- **21 GB** live HTML + **339 MB** Wayback HTML + **164 MB** logs.
+- **7,944** media assets downloaded (7,041 avatars + 793 emoticons +
+  104 post images + 6 gallery items), **51 MB** on disk. Another 3,016
+  returned legitimate 404/400/403 from the server and 4,406 lived on
+  dead hosts/ports that were skipped without a request.
+- **21 GB** live HTML + **339 MB** Wayback HTML + **51 MB** media +
+  **164 MB** logs.
 
 ## Coverage by forum
 
@@ -65,8 +70,10 @@ data/
 │   └── index/<forum_id>/<wayback_ts>.html
 │                             49 closed-forum index snapshots
 ├── media/
-│   ├── avatars/, emoticons/, post_images/, gallery/
-│                             empty — see "Media")
+│   ├── avatars/             39 MB, 7,041 files
+│   ├── emoticons/           1.6 MB, 793 files
+│   ├── post_images/         10 MB, 104 files
+│   └── gallery/             24 KB, 6 files
 └── logs/archiver.log         164 MB
 ```
 
@@ -85,7 +92,10 @@ data/
   worklist + audit trail. `status` ∈ {`pending`, `recovered`,
   `no_capture`, `error`, `no_forum`, `skipped`}.
 - **`media`** — one row per asset URL discovered in any captured HTML
-  (live or wayback). `status` mostly `pending` (no media run yet).
+  (live or wayback). `status` ∈ {`downloaded`, `error`, `skipped`}
+  with `pending` cleared. 51.7% of all known URLs landed on disk;
+  the rest are real server-side 4xx or URLs that point at dead
+  hosts/ports we never bothered to request.
 - **`forums`** — empty. Was meant to hold forum names but the
   enumeration step was never run; forum IDs above were derived from
   thread join.
@@ -119,26 +129,29 @@ data/
    `http://prince.org:81/...` avatar/image URLs to their working
    `https://prince.org:444/...` equivalents, marked the :81 rows as
    `skipped` with audit message. No HTTP traffic, just a SQL pass.
+7. **Media download** — **7,944** assets pulled to `data/media/` over
+   four restarts (commits `f956796`, `3488b3a`, `19c489b`, `601a1a3`).
+   Each restart fixed a real bug: `httpx.RemoteProtocolError` wasn't in
+   the retry catch list, the transient-error auto-re-pend filter was
+   too loose and dragged dead external hosts back into the worklist,
+   and the tightened `%prince.org%` filter still matched the dead
+   `img.prince.org` subdomain. Final filter pins the re-pend to the
+   four canonical-host URL prefixes (https/http × `prince.org/` /
+   `prince.org:`). 99.97% of remaining errors are real HTTP 4xx.
 
 Each step is documented in `git log` with the substantive design
 decisions explained in the commit body.
 
 ## What was NOT done — open work
 
-1. **Media download.** All 11,003 viable media URLs (10,054 avatars,
-   806 emoticons, 137 post images, 6 gallery items) are sitting
-   `pending`. Live probes confirm they're reachable; run is
-   `prince-org-archiver crawl media` at ~0.5 req/s = ~6 h. Expected
-   yield ~75-80% on avatars (the rest are deleted accounts), ~100% on
-   emoticons and post images.
-2. **Events calendar.** The `crawl events` command exists and the
+1. **Events calendar.** The `crawl events` command exists and the
    schema is in place but it was never run. ~27 years × 12 months ≈
    324 monthly event pages, mostly tiny. Probably not high-value.
-3. **Forum metadata enumeration.** The `forums` table is empty. Forum
+2. **Forum metadata enumeration.** The `forums` table is empty. Forum
    names would have to be scraped from the top-level forum index;
    nothing in the code currently does this. The IDs are derivable from
    thread joins (above table), so it's mostly cosmetic.
-4. **The 3 unparseable Wayback HTMLs.** Files
+3. **The 3 unparseable Wayback HTMLs.** Files
    `data/wayback/threads/075/75340/...`,
    `data/wayback/threads/104/104337/...`, and
    `data/wayback/threads/349/349090/...` contain real thread content
@@ -146,13 +159,16 @@ decisions explained in the commit body.
    closed" banner, which `classify_response` matches before the
    msg-body markers, returning `FORUM_CLOSED`. 0.04% loss; the files
    are on disk and human-readable.
-5. **The 21,133 gated threads with no Wayback capture.** Most likely
+4. **The 21,133 gated threads with no Wayback capture.** Most likely
    never archived (archive.org rarely crawled private-by-default
    threads, and these were moderator-removed before its bots noticed
    them). The 3.5 KB error-page stubs are still saved at
    `data/html/threads/<bucket>/<thread_id>/page_1.html`.
-6. **The 59,900 Wayback no-capture rows.** Threads in closed/gated
+5. **The 59,900 Wayback no-capture rows.** Threads in closed/gated
    buckets where archive.org honestly has nothing. No action available.
+6. **3,016 media URLs returned real HTTP 4xx** — deleted avatars,
+   malformed URLs in old post HTML, the occasional 403. Not
+   recoverable without server-side cooperation.
 
 ## How to query
 
