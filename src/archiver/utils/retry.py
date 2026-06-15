@@ -51,7 +51,13 @@ async def retry_request(
 
             return response
 
-        except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as e:
+        except httpx.TransportError as e:
+            # Base class for the whole transport-level family --
+            # TimeoutException, ConnectError, ReadError, WriteError,
+            # RemoteProtocolError, ProxyError, etc. Listing only the
+            # first three lost us a full overnight run when prince.org
+            # disconnected mid-response (RemoteProtocolError) and the
+            # uncaught exception killed crawl_media's gather().
             last_error = e
             if attempt < max_retries:
                 delay = min(base_delay * (2**attempt), max_delay)
