@@ -525,19 +525,25 @@ class Database:
         """Re-pend media rows that errored on transient network failures
         so a plain restart of `crawl media` retries them automatically.
 
-        Distinguishes by error_message prefix:
-          * 'Retry exhausted ...'  -> from RetryExhausted in client.py,
-            i.e. the network was unreachable through the full 6-attempt
-            backoff ladder (~4 min). Re-pendable: the file is likely
-            fine, we just couldn't reach the server.
-          * 'HTTP <code>'         -> from a non-retryable HTTP status
-            (404, 410, 403). Kept terminal -- retrying won't change
-            anything and just wastes traffic against prince.org.
+        Two filters:
+          * `error_message LIKE 'Retry exhausted%'` -- from RetryExhausted
+            in client.py (the network was unreachable through the full
+            6-attempt backoff ladder, ~4 min). Anything starting with
+            'HTTP <code>' is a hard rejection (404/410/403) and stays
+            terminal -- retrying won't change anything.
+          * `url LIKE '%prince.org%'` -- only re-pend our-target host.
+            External URLs (avatars/images hosted on long-dead 2008-era
+            forums like gatt.co.tt, madonna-avatars.ch, ebaumsworld...)
+            have ~0% revival rate; re-pending them just clusters more
+            doomed RetryExhausted bursts at the front of the queue and
+            blows the consecutive-error budget on restart.
 
         Returns the number of rows re-pended."""
         cur = await self.db.execute(
             "UPDATE media SET status = 'pending', error_message = NULL "
-            "WHERE status = 'error' AND error_message LIKE 'Retry exhausted%'"
+            "WHERE status = 'error' "
+            "AND error_message LIKE 'Retry exhausted%' "
+            "AND url LIKE '%prince.org%'"
         )
         await self.db.commit()
         return cur.rowcount
