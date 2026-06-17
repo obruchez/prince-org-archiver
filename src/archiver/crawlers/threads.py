@@ -272,7 +272,7 @@ async def refresh_recent_threads(
 
         parsed = parse_thread_page(thread_id, 1, result.content)
         meta = parsed.metadata
-        if parsed.response_type != ResponseType.SUCCESS or not meta:
+        if parsed.response_type != ResponseType.THREAD_FOUND or not meta:
             # Thread went private/got closed/got removed since last crawl.
             # Don't downgrade the existing row's status -- the historical
             # capture on disk is still valid -- just count and move on.
@@ -365,10 +365,11 @@ async def crawl_remaining_pages(
 
         for thread in threads:
             thread_id = thread["thread_id"]
+            forum_id = thread["forum_id"]
 
             for pg in await db.get_pending_pages(thread_id):
                 async with sem:
-                    url = client.thread_url(thread_id, pg)
+                    url = client.thread_url(thread_id, pg, forum_id=forum_id)
                     try:
                         result = await client.fetch(url)
                     except MaxRequestsReached:
@@ -383,6 +384,23 @@ async def crawl_remaining_pages(
                         logger.warning(
                             f"Thread {thread_id} page {pg}: giving up after "
                             f"{MAX_PAGE_RETRIES} attempts ({result.error})"
+                        )
+                    continue
+
+                # Defensive sanity check: if the server redirected us off
+                # our pg=N query and we landed back on page 1, do NOT save
+                # the response -- that's exactly the bug that corrupted
+                # ~142K pages before the forum_id fix. Mark as error so
+                # the retry budget eventually gives up cleanly.
+                if pg > 1 and result.final_url and f"pg={pg}" not in result.final_url:
+                    final_status = await db.record_page_failure(
+                        thread_id, pg, MAX_PAGE_RETRIES
+                    )
+                    stats["errors"] += 1
+                    if final_status == PageStatus.FAILED.value:
+                        logger.warning(
+                            f"Thread {thread_id} page {pg}: server redirected "
+                            f"off pagination ({url} -> {result.final_url}); giving up"
                         )
                     continue
 

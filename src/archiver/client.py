@@ -110,8 +110,19 @@ class HttpClient:
                 error=str(e),
             )
 
-    def thread_url(self, thread_id: int, page: int = 1) -> str:
-        url = f"{self.config.base_url}/msg/7/{thread_id}"
+    def thread_url(
+        self, thread_id: int, page: int = 1, forum_id: int | None = None
+    ) -> str:
+        # We default the URL prefix to /msg/7/ (the largest forum). When a
+        # thread actually lives in a different forum the server 301-redirects
+        # to /msg/<real-forum>/<thread_id> -- but crucially that redirect
+        # STRIPS the `?pg=N` query parameter. So for page 1 the default is
+        # fine (page 1 has no pg=), but for pages 2+ we MUST send the real
+        # forum_id or we'd silently get page 1 saved under page_N.html.
+        # This bug corrupted ~142K pages on the original live crawl before
+        # the forum_id arg was added (commit 2026-06-17).
+        fid = forum_id if forum_id is not None else 7
+        url = f"{self.config.base_url}/msg/{fid}/{thread_id}"
         if page > 1:
             url += f"?&pg={page}"
         return url
