@@ -203,6 +203,143 @@ async def crawl_thread_ids(
     return stats
 
 
+async def refresh_recent_threads(
+    config: Config,
+    db: Database,
+    client: HttpClient,
+    *,
+    since_date: str,
+    forum_ids: list[int] | None = None,
+    progress_callback=None,
+) -> dict:
+    """Re-pull threads whose last_post_date is on/after `since_date` so the
+    archive picks up new replies.
+
+    Strategy is partial-refresh rather than full re-download:
+      - Page 1 is always re-fetched (cheap, reveals the current page_count
+        and any title/author changes).
+      - The previously-last page is re-queued -- on this forum, new posts
+        land on the existing last page until it fills up, after which a
+        new page is created. Re-fetching the old last page is the only
+        way to capture those in-place additions.
+      - Pages above the old page_count are queued as PENDING.
+      - Pages strictly between page 2 and old_last_page - 1 are NOT
+        re-queued; on this forum's UI they're frozen the moment they
+        spill over to the next page.
+
+    Phase 2 (`crawl_remaining_pages`) then handles the actual downloads
+    for everything we queued, so the typical workflow is to call this
+    function and let the normal crawl pipeline continue.
+    """
+    stats = {
+        "checked": 0, "grew": 0, "unchanged": 0,
+        "pages_queued": 0, "errors": 0,
+    }
+
+    targets = await db.get_threads_for_refresh(
+        since_date=since_date, forum_ids=forum_ids
+    )
+    if not targets:
+        logger.info(f"No threads with activity since {since_date} to refresh")
+        return stats
+
+    logger.info(
+        f"Refreshing {len(targets):,} threads with activity since {since_date}"
+        + (f" (forums {forum_ids})" if forum_ids else "")
+    )
+
+    sem = asyncio.Semaphore(config.concurrency)
+
+    async def refresh_one(row: dict) -> None:
+        thread_id = row["thread_id"]
+        old_page_count = row["page_count"] or 1
+        stats["checked"] += 1
+
+        async with sem:
+            url = client.thread_url(thread_id)
+            try:
+                result = await client.fetch(url)
+            except MaxRequestsReached:
+                return
+
+        if result.error or result.status_code not in (200, 301, 302):
+            stats["errors"] += 1
+            logger.debug(
+                f"Thread {thread_id}: refresh failed "
+                f"({result.error or 'HTTP ' + str(result.status_code)})"
+            )
+            return
+
+        parsed = parse_thread_page(thread_id, 1, result.content)
+        meta = parsed.metadata
+        if parsed.response_type != ResponseType.SUCCESS or not meta:
+            # Thread went private/got closed/got removed since last crawl.
+            # Don't downgrade the existing row's status -- the historical
+            # capture on disk is still valid -- just count and move on.
+            stats["errors"] += 1
+            logger.info(
+                f"Thread {thread_id}: now {parsed.response_type.value}, "
+                "leaving existing archive row intact"
+            )
+            return
+
+        # Save the fresh page 1
+        html_path = save_thread_page(config, thread_id, 1, result.content)
+        save_thread_metadata(config, meta)
+
+        await db.upsert_thread(
+            thread_id,
+            forum_id=meta.forum_id,
+            title=meta.title,
+            author=meta.author,
+            page_count=meta.page_count,
+            status=ThreadStatus.COMPLETE,
+        )
+        await db.upsert_page(
+            thread_id, 1,
+            status=PageStatus.DOWNLOADED,
+            html_path=str(html_path),
+            post_count=parsed.post_count,
+            file_size=len(result.content),
+        )
+
+        for media_url in parsed.media_urls:
+            mtype = classify_media_url(media_url)
+            if mtype:
+                await db.add_media(media_url, mtype, source_thread_id=thread_id)
+
+        # Re-queue the previously-last page (where new replies land in place)
+        # plus any newly-created pages above old_page_count.
+        # max(2, ...) skips page 1 (we just downloaded it).
+        queue_from = max(2, old_page_count)
+        queued_here = 0
+        for pg in range(queue_from, meta.page_count + 1):
+            await db.upsert_page(thread_id, pg, status=PageStatus.PENDING)
+            queued_here += 1
+
+        stats["pages_queued"] += queued_here
+        if meta.page_count > old_page_count:
+            stats["grew"] += 1
+        else:
+            stats["unchanged"] += 1
+
+        if progress_callback:
+            progress_callback(stats)
+
+    # Drive in batches so the progress callback fires periodically and the
+    # rate limiter doesn't have to chew through tens of thousands of tasks
+    # queued at once.
+    batch_size = 50
+    for i in range(0, len(targets), batch_size):
+        batch = targets[i : i + batch_size]
+        await asyncio.gather(*(refresh_one(r) for r in batch))
+        if config.max_requests and client.request_count >= config.max_requests:
+            logger.info(f"Max requests ({config.max_requests}) reached, stopping refresh")
+            break
+
+    return stats
+
+
 async def crawl_remaining_pages(
     config: Config,
     db: Database,

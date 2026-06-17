@@ -1,7 +1,9 @@
 import asyncio
 import logging
+import re
 import signal
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 
 import click
@@ -77,6 +79,27 @@ def parse_duration(s: str | None) -> int | None:
     return int(s)
 
 
+def parse_since_date(s: str | None) -> str | None:
+    """Accept either an ISO date (`2026-03-19`) or a relative offset
+    (`60d`, `8w`, `3m`, `1y`) and return an ISO date string suitable
+    for `last_post_date >= ?` comparison."""
+    if not s:
+        return None
+    s = s.strip().lower()
+    # ISO date pass-through
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        return s
+    m = re.fullmatch(r"(\d+)([dwmy])", s)
+    if not m:
+        raise click.BadParameter(
+            f"--refresh-since: expected ISO date (YYYY-MM-DD) or "
+            f"relative offset like 60d/8w/3m/1y, got {s!r}"
+        )
+    n = int(m.group(1))
+    unit_days = {"d": 1, "w": 7, "m": 30, "y": 365}[m.group(2)]
+    return (date.today() - timedelta(days=n * unit_days)).isoformat()
+
+
 def make_config(data_dir, rate, concurrency, max_requests, max_duration, retry_errors, **kwargs) -> Config:
     return Config(
         data_dir=Path(data_dir),
@@ -96,8 +119,15 @@ def make_config(data_dir, rate, concurrency, max_requests, max_duration, retry_e
 @click.option("--forum", type=int, default=None, help="Only crawl threads from this forum")
 @click.option("--priority-forums", type=str, default="7,100,8", help="Comma-separated priority forum IDs")
 @click.option("--pages/--no-pages", default=True, help="Also download remaining pages of multi-page threads")
+@click.option(
+    "--refresh-since",
+    type=str,
+    default=None,
+    help="Before enumerating new IDs, re-pull threads with activity since "
+         "this point. Accepts ISO date (2026-03-19) or relative (60d/8w/3m/1y).",
+)
 def crawl_threads(data_dir, rate, concurrency, max_requests, max_duration, retry_errors, verbose,
-                  start_id, end_id, forum, priority_forums, pages):
+                  start_id, end_id, forum, priority_forums, pages, refresh_since):
     """Discover threads and download pages."""
     extra = {}
     if start_id:
@@ -108,6 +138,8 @@ def crawl_threads(data_dir, rate, concurrency, max_requests, max_duration, retry
         extra["forum_filter"] = forum
     extra["priority_forums"] = [int(x) for x in priority_forums.split(",")]
 
+    refresh_since_date = parse_since_date(refresh_since)
+
     config = make_config(data_dir, rate, concurrency, max_requests, max_duration, retry_errors, **extra)
     setup_logging(config, verbose)
     config.ensure_dirs()
@@ -115,17 +147,61 @@ def crawl_threads(data_dir, rate, concurrency, max_requests, max_duration, retry
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
-    asyncio.run(_run_thread_crawl(config, pages))
+    asyncio.run(_run_thread_crawl(config, pages, refresh_since_date))
 
 
-async def _run_thread_crawl(config: Config, download_pages: bool):
-    from archiver.crawlers.threads import crawl_remaining_pages, crawl_thread_ids
+async def _run_thread_crawl(
+    config: Config,
+    download_pages: bool,
+    refresh_since_date: str | None = None,
+):
+    from archiver.crawlers.threads import (
+        crawl_remaining_pages,
+        crawl_thread_ids,
+        refresh_recent_threads,
+    )
 
     db = Database(config.db_path)
     await db.connect()
     await db.recover_from_crash()
 
     async with HttpClient(config) as client:
+        # Phase 0 (optional): refresh recently-active threads
+        if refresh_since_date and not _shutdown:
+            forum_filter = (
+                [config.forum_filter] if config.forum_filter else None
+            )
+            console.print(
+                f"[bold]Phase 0: Refresh threads with activity since "
+                f"{refresh_since_date}[/bold]"
+                + (f" (forum {config.forum_filter})" if forum_filter else "")
+            )
+
+            def on_refresh_progress(stats):
+                if _shutdown:
+                    raise KeyboardInterrupt
+                if stats["checked"] % 100 == 0:
+                    console.print(
+                        f"  Refreshed {stats['checked']:,} "
+                        f"(grew={stats['grew']:,} unchanged={stats['unchanged']:,} "
+                        f"errors={stats['errors']:,}) "
+                        f"| pages queued={stats['pages_queued']:,} "
+                        f"| {client.request_count:,} requests"
+                    )
+
+            try:
+                rstats = await refresh_recent_threads(
+                    config, db, client,
+                    since_date=refresh_since_date,
+                    forum_ids=forum_filter,
+                    progress_callback=on_refresh_progress,
+                )
+                console.print(f"[green]Refresh complete:[/green] {rstats}")
+            except KeyboardInterrupt:
+                console.print("[yellow]Interrupted. Progress saved.[/yellow]")
+                await db.close()
+                return
+
         # Phase 1: Thread discovery
         console.print(f"[bold]Phase 1: Thread discovery[/bold] (IDs {config.start_id} - {config.end_id})")
 

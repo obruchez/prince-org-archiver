@@ -251,6 +251,41 @@ class Database:
             )
         return [dict(r) for r in rows]
 
+    async def get_threads_for_refresh(
+        self,
+        *,
+        since_date: str,
+        forum_ids: list[int] | None = None,
+    ) -> list[dict]:
+        """Return (thread_id, page_count, forum_id) for complete threads whose
+        last_post_date is on/after `since_date` (ISO YYYY-MM-DD).
+
+        The caller uses page_count as the "old last page" anchor for the
+        partial-refresh strategy: re-fetch page 1 to learn the current
+        page_count, also re-fetch the previously-last page (new posts land
+        there first), and queue any pages above the old high-water mark.
+        Pages strictly between 2 and old_page_count - 1 are not touched --
+        they're historical and immutable in this forum's model."""
+        if forum_ids:
+            placeholders = ",".join("?" * len(forum_ids))
+            rows = await self.db.execute_fetchall(
+                f"""SELECT thread_id, page_count, forum_id FROM threads
+                    WHERE status = 'complete'
+                    AND last_post_date >= ?
+                    AND forum_id IN ({placeholders})
+                    ORDER BY last_post_date DESC""",
+                (since_date, *forum_ids),
+            )
+        else:
+            rows = await self.db.execute_fetchall(
+                """SELECT thread_id, page_count, forum_id FROM threads
+                   WHERE status = 'complete'
+                   AND last_post_date >= ?
+                   ORDER BY last_post_date DESC""",
+                (since_date,),
+            )
+        return [dict(r) for r in rows]
+
     async def get_pending_pages(self, thread_id: int) -> list[int]:
         """Page numbers for a thread that still need fetching (not terminal)."""
         rows = await self.db.execute_fetchall(
