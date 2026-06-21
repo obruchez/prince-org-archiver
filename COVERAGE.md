@@ -1,8 +1,9 @@
 # Prince.org archive — coverage summary
 
 Snapshot of what this archive contains, how it's laid out, and where the
-remaining gaps are. Numbers were captured on 2026-06-16, after the
-Wayback recovery, integration, and media download passes completed.
+remaining gaps are. Numbers were captured on 2026-06-21, after the
+Wayback recovery, integration, media download, and a 60-day partial
+refresh (which also repaired the forum-redirect bug) all completed.
 
 ## Headline
 
@@ -17,15 +18,15 @@ Wayback recovery, integration, and media download passes completed.
 - **21,133** "gated" stubs remain unresolvable — moderator-removed
   threads with no Wayback capture; the only known content is the 3.5 KB
   "Thread missing or not yet approved" error page the live site serves.
-- **First archived post:** 1999-03-16. **Most recent:** 2026-04-22.
+- **First archived post:** 1999-03-16. **Most recent:** 2026-04-27.
   ~27 years of continuous forum history.
-- **639,694** thread pages stored on disk (631,562 live + 8,132 wayback).
+- **639,700** thread pages stored on disk (631,568 live + 8,132 wayback).
 - **7,944** media assets downloaded (7,041 avatars + 793 emoticons +
   104 post images + 6 gallery items), **51 MB** on disk. Another 3,016
   returned legitimate 404/400/403 from the server and 4,406 lived on
   dead hosts/ports that were skipped without a request.
-- **21 GB** live HTML + **339 MB** Wayback HTML + **51 MB** media +
-  **164 MB** logs.
+- **20 GB** live HTML + **339 MB** Wayback HTML + **51 MB** media +
+  **181 MB** logs.
 
 ## Coverage by forum
 
@@ -59,10 +60,10 @@ with a 3.5 KB error stub instead of real content (moderator-removed).
 
 ```
 data/
-├── archive.db                 SQLite, 178 MB — the canonical index
+├── archive.db                 SQLite, 162 MB — the canonical index
 ├── html/
 │   ├── threads/<bucket>/<thread_id>/page_<N>.html
-│   │                         631,562 live-crawl HTMLs, ~21 GB
+│   │                         631,568 live-crawl HTMLs, ~20 GB
 │   └── events/<year>/<MM>.html   (not crawled — see "Not done")
 ├── wayback/
 │   ├── threads/<bucket>/<thread_id>/<wayback_ts>.html
@@ -74,7 +75,7 @@ data/
 │   ├── emoticons/           1.6 MB, 793 files
 │   ├── post_images/         10 MB, 104 files
 │   └── gallery/             24 KB, 6 files
-└── logs/archiver.log         164 MB
+└── logs/archiver.log         181 MB
 ```
 
 `<bucket>` is the thread ID's first three digits, zero-padded
@@ -138,20 +139,42 @@ data/
    `img.prince.org` subdomain. Final filter pins the re-pend to the
    four canonical-host URL prefixes (https/http × `prince.org/` /
    `prince.org:`). 99.97% of remaining errors are real HTTP 4xx.
+8. **Partial refresh + forum-redirect bug fix** (commits `c461d03`,
+   `aba7564`). Added `crawl threads --refresh-since DURATION` to re-fetch
+   page 1 + previously-last page + any newly-created pages for threads
+   whose `last_post_date` is on/after the cutoff. Test run with `60d`
+   surfaced a silent pre-existing bug: `client.thread_url()` hardcoded
+   `/msg/7/<id>` for every forum; the server 301-redirects to the real
+   `/msg/<forum>/<id>` but **strips the `?pg=N` query parameter** in
+   the process, so pages 2+ of any non-forum-7 thread silently saved
+   page 1's content under `page_N.html`. Scope: 141,469 pages across
+   62,240 threads (≈22% of all multi-page live-crawl content). Fixed
+   by threading `forum_id` through to `thread_url()` plus a defensive
+   `pg=N must be in final_url` sanity check before save. All 141,469
+   corrupted pages re-queued and re-downloaded successfully (12 hit
+   transient `ConnectError`s during a brief connectivity blip but
+   self-healed via the per-page re-pend path).
 
 Each step is documented in `git log` with the substantive design
 decisions explained in the commit body.
 
 ## What was NOT done — open work
 
-1. **Events calendar.** The `crawl events` command exists and the
+1. **New threads since 2026-04-27.** The discovery checkpoint
+   (`crawl_state.last_enumerated_id`) is still at 475,000. The 60-day
+   refresh picked up new replies on existing threads (`last_post_date`
+   advanced from 2026-04-22 to 2026-04-27) but didn't bump the
+   discovery ceiling. Re-run with `crawl threads --end-id <higher>`
+   (or another `--refresh-since`) to pick up genuinely new threads
+   posted after 2026-04-22.
+2. **Events calendar.** The `crawl events` command exists and the
    schema is in place but it was never run. ~27 years × 12 months ≈
    324 monthly event pages, mostly tiny. Probably not high-value.
-2. **Forum metadata enumeration.** The `forums` table is empty. Forum
+3. **Forum metadata enumeration.** The `forums` table is empty. Forum
    names would have to be scraped from the top-level forum index;
    nothing in the code currently does this. The IDs are derivable from
    thread joins (above table), so it's mostly cosmetic.
-3. **The 3 unparseable Wayback HTMLs.** Files
+4. **The 3 unparseable Wayback HTMLs.** Files
    `data/wayback/threads/075/75340/...`,
    `data/wayback/threads/104/104337/...`, and
    `data/wayback/threads/349/349090/...` contain real thread content
@@ -159,14 +182,14 @@ decisions explained in the commit body.
    closed" banner, which `classify_response` matches before the
    msg-body markers, returning `FORUM_CLOSED`. 0.04% loss; the files
    are on disk and human-readable.
-4. **The 21,133 gated threads with no Wayback capture.** Most likely
+5. **The 21,133 gated threads with no Wayback capture.** Most likely
    never archived (archive.org rarely crawled private-by-default
    threads, and these were moderator-removed before its bots noticed
    them). The 3.5 KB error-page stubs are still saved at
    `data/html/threads/<bucket>/<thread_id>/page_1.html`.
-5. **The 59,900 Wayback no-capture rows.** Threads in closed/gated
+6. **The 59,900 Wayback no-capture rows.** Threads in closed/gated
    buckets where archive.org honestly has nothing. No action available.
-6. **3,016 media URLs returned real HTTP 4xx** — deleted avatars,
+7. **3,016 media URLs returned real HTTP 4xx** — deleted avatars,
    malformed URLs in old post HTML, the occasional 403. Not
    recoverable without server-side cooperation.
 
