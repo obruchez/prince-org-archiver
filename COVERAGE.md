@@ -1,16 +1,20 @@
 # Prince.org archive — coverage summary
 
 Snapshot of what this archive contains, how it's laid out, and where the
-remaining gaps are. Numbers were captured on 2026-06-21, after the
-Wayback recovery, integration, media download, and a 60-day partial
-refresh (which also repaired the forum-redirect bug) all completed.
+remaining gaps are. Numbers were captured on 2026-06-22, after the
+Wayback recovery, integration, media download, a 60-day partial
+refresh (which also repaired the forum-redirect bug), a final
+discovery pass extending the ID ceiling to 490,000, and the events
+calendar crawl all completed.
 
 ## Headline
 
-- **474,135** distinct thread IDs probed (range 1–475,000)
-  - **422,243** complete (text content fully captured from the live site)
+- **490,000** distinct thread IDs probed (contiguous range 1–490,000)
+  - **422,324** complete (text content fully captured from the live site)
   - **46,053** in permanently closed forums (no content on the live site)
-  - **6,704** never existed / deleted IDs (terminal `not_found`)
+  - **21,623** never existed / deleted IDs (terminal `not_found`).
+    Includes 15,000 IDs in 475,001–490,000 confirmed empty on 2026-06-21
+    (the prince.org thread-ID counter had only reached ~472,059 by then).
 - **8,135** of the 46,053 closed-forum threads recovered via the
   Wayback Machine (17.7%) and now folded into the main schema
   alongside the live-crawl content. Index pages for all 10 closed
@@ -20,21 +24,22 @@ refresh (which also repaired the forum-redirect bug) all completed.
   "Thread missing or not yet approved" error page the live site serves.
 - **First archived post:** 1999-03-16. **Most recent:** 2026-04-27.
   ~27 years of continuous forum history.
-- **639,700** thread pages stored on disk (631,568 live + 8,132 wayback).
+- **639,807** thread pages stored on disk (631,675 live + 8,132 wayback).
 - **7,944** media assets downloaded (7,041 avatars + 793 emoticons +
   104 post images + 6 gallery items), **51 MB** on disk. Another 3,016
   returned legitimate 404/400/403 from the server and 4,406 lived on
   dead hosts/ports that were skipped without a request.
+- **348** monthly events-calendar pages (Jan 1998 – Dec 2026), 5.6 MB.
 - **20 GB** live HTML + **339 MB** Wayback HTML + **51 MB** media +
-  **181 MB** logs.
+  **5.6 MB** events + **181 MB** logs.
 
 ## Coverage by forum
 
 | forum_id | threads | complete | closed | recovered via Wayback |
 | --- | ---: | ---: | ---: | ---: |
-| 100 | 118,859 | 118,859 | 0 | 242 |
-| 7 | 109,204 | 109,204 | 0 | 397 |
-| 8 | 107,899 | 107,898 | 1 | 74 |
+| 100 | 118,861 | 118,861 | 0 | 242 |
+| 7 | 109,263 | 109,263 | 0 | 397 |
+| 8 | 107,916 | 107,915 | 1 | 74 |
 | 105 (politics/religion, closed ~2023) | 34,671 | 0 | 34,671 | **7,268** |
 | 12 | 13,554 | 13,554 | 0 | 23 |
 | 5 | 12,890 | 12,890 | 0 | 49 |
@@ -42,7 +47,7 @@ refresh (which also repaired the forum-redirect bug) all completed.
 | 15 | 8,878 | 8,878 | 0 | 10 |
 | 9 | 6,719 | 6,719 | 0 | 28 |
 | 300 (closed) | 6,203 | 0 | 6,203 | 8 |
-| 3 | 4,714 | 4,712 | 2 | 6 |
+| 3 | 4,717 | 4,715 | 2 | 6 |
 | 13 | 4,681 | 4,681 | 0 | 9 |
 | 10 (closed) | 3,902 | 0 | 3,902 | 7 |
 | 2 | 3,709 | 3,709 | 0 | 3 |
@@ -63,8 +68,8 @@ data/
 ├── archive.db                 SQLite, 162 MB — the canonical index
 ├── html/
 │   ├── threads/<bucket>/<thread_id>/page_<N>.html
-│   │                         631,568 live-crawl HTMLs, ~20 GB
-│   └── events/<year>/<MM>.html   (not crawled — see "Not done")
+│   │                         631,675 live-crawl HTMLs, ~20 GB
+│   └── events/<year>/<MM>.html   348 files, 5.6 MB
 ├── wayback/
 │   ├── threads/<bucket>/<thread_id>/<wayback_ts>.html
 │   │                         8,132 archive.org recoveries, ~339 MB
@@ -100,8 +105,9 @@ data/
 - **`forums`** — empty. Was meant to hold forum names but the
   enumeration step was never run; forum IDs above were derived from
   thread join.
-- **`events`** — empty. The events-calendar crawler (`crawl events`)
-  was never run.
+- **`events`** — one row per (year, month) for Jan 1998 – Dec 2026
+  (348 rows, all `downloaded`). HTML at
+  `data/html/events/<year>/<MM>.html`.
 - **`crawl_state`** — internal key/value (resume checkpoints).
 
 ## What was done — chronological
@@ -154,27 +160,35 @@ data/
    corrupted pages re-queued and re-downloaded successfully (12 hit
    transient `ConnectError`s during a brief connectivity blip but
    self-healed via the per-page re-pend path).
+9. **Discovery ceiling extension to 490,000** (2026-06-21/22). The
+   original crawl had stopped enumeration at `--end-id 475000` and
+   `crawl_state.last_enumerated_id` recorded 475,000 even though the
+   highest real thread at the time was 471,978. Two passes:
+   `crawl threads --end-id 490000` first confirmed IDs 475,001–490,000
+   are all empty (15,000 not_found, prince.org's counter only reached
+   ~472,059 by the probe date); then a targeted re-probe of the
+   skipped gap (`--start-id 471979 --end-id 475000` after deleting
+   stale not_found rows in 471,979–472,500) picked up **81 new
+   threads** (471,979–472,059) created since the original crawl.
+10. **Events calendar crawl** (2026-06-22). Ran the existing
+    `crawl events` command for the first time. Downloaded 348 monthly
+    pages spanning Jan 1998 – Dec 2026, 5.6 MB, 0 errors.
 
 Each step is documented in `git log` with the substantive design
 decisions explained in the commit body.
 
 ## What was NOT done — open work
 
-1. **New threads since 2026-04-27.** The discovery checkpoint
-   (`crawl_state.last_enumerated_id`) is still at 475,000. The 60-day
-   refresh picked up new replies on existing threads (`last_post_date`
-   advanced from 2026-04-22 to 2026-04-27) but didn't bump the
-   discovery ceiling. Re-run with `crawl threads --end-id <higher>`
-   (or another `--refresh-since`) to pick up genuinely new threads
-   posted after 2026-04-22.
-2. **Events calendar.** The `crawl events` command exists and the
-   schema is in place but it was never run. ~27 years × 12 months ≈
-   324 monthly event pages, mostly tiny. Probably not high-value.
-3. **Forum metadata enumeration.** The `forums` table is empty. Forum
+1. **Periodic refresh.** Archive is current through 2026-04-27 with the
+   discovery ceiling at 490,000 (well above the live-site max of ~472,059
+   as of 2026-06-22). To keep it fresh, re-run `crawl threads
+   --refresh-since 30d` and/or extend `--end-id` further when the live
+   max approaches 490,000. No automation is wired up.
+2. **Forum metadata enumeration.** The `forums` table is empty. Forum
    names would have to be scraped from the top-level forum index;
    nothing in the code currently does this. The IDs are derivable from
    thread joins (above table), so it's mostly cosmetic.
-4. **The 3 unparseable Wayback HTMLs.** Files
+3. **The 3 unparseable Wayback HTMLs.** Files
    `data/wayback/threads/075/75340/...`,
    `data/wayback/threads/104/104337/...`, and
    `data/wayback/threads/349/349090/...` contain real thread content
@@ -182,14 +196,14 @@ decisions explained in the commit body.
    closed" banner, which `classify_response` matches before the
    msg-body markers, returning `FORUM_CLOSED`. 0.04% loss; the files
    are on disk and human-readable.
-5. **The 21,133 gated threads with no Wayback capture.** Most likely
+4. **The 21,133 gated threads with no Wayback capture.** Most likely
    never archived (archive.org rarely crawled private-by-default
    threads, and these were moderator-removed before its bots noticed
    them). The 3.5 KB error-page stubs are still saved at
    `data/html/threads/<bucket>/<thread_id>/page_1.html`.
-6. **The 59,900 Wayback no-capture rows.** Threads in closed/gated
+5. **The 59,900 Wayback no-capture rows.** Threads in closed/gated
    buckets where archive.org honestly has nothing. No action available.
-7. **3,016 media URLs returned real HTTP 4xx** — deleted avatars,
+6. **3,016 media URLs returned real HTTP 4xx** — deleted avatars,
    malformed URLs in old post HTML, the occasional 403. Not
    recoverable without server-side cooperation.
 
